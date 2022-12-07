@@ -22,4 +22,6 @@ export class Anime {
   rank: string;
   @Column()
   region: string;
+  @Column()
+  status: string;
 }

@@ -12,12 +12,7 @@ export class UserService {
     private userRepository: Repository<User>,
   ) {}
 
-  /**
-   * 注册/添加新用户
-   * @param createUserDto 管道实体
-   * @returns Promise
-   */
-  async create(createUserDto: CreateUserDto) {
+  async register(createUserDto: CreateUserDto) {
     const { username } = createUserDto;
     const existUser = await this.userRepository.findOne({
       where: { username },
@@ -29,19 +24,25 @@ export class UserService {
     return await this.userRepository.save(newUser);
   }
 
-  findAll() {
-    return `This action returns all user`;
+  async findAll() {
+    return await this.userRepository.find();
   }
 
-  findOne(id: number) {
-    return `This action returns a #${id} user`;
+  async findOne(id: string) {
+    const data = await this.userRepository.findOne({
+      where: { user_id: id },
+    });
+    if (data === undefined) {
+      throw new HttpException('该用户不存在', HttpStatus.BAD_REQUEST);
+    }
+    return data;
   }
 
-  update(id: number, updateUserDto: UpdateUserDto) {
+  update(id: string, updateUserDto: UpdateUserDto) {
     return `This action updates a #${id} user`;
   }
 
-  remove(id: number) {
+  remove(id: string) {
     return `This action removes a #${id} user`;
   }
 }
