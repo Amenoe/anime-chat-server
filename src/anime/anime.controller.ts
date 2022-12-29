@@ -6,7 +6,6 @@ import {
   Patch,
   Param,
   Delete,
-  Query,
 } from '@nestjs/common';
 import { AnimeService } from './anime.service';
 import { CreateAnimeDto } from './dto/create-anime.dto';
@@ -16,10 +15,33 @@ import { UpdateAnimeDto } from './dto/update-anime.dto';
 export class AnimeController {
   constructor(private readonly animeService: AnimeService) {}
 
-  @Get('getIndex')
+  /**
+   * 首页数据
+   * @returns
+   */
+  @Get('index')
   getIndex() {
-    console.log('getIndex');
     return this.animeService.getIndex();
+  }
+
+  /**
+   * 详情页数据
+   * @param id
+   * @returns
+   */
+  @Get('detail/:id')
+  getDetail(@Param('id') id: string) {
+    return this.animeService.getDetail(id);
+  }
+
+  @Get(':id')
+  findOne(@Param('id') id: string) {
+    return this.animeService.findOne(+id);
+  }
+
+  @Get('filter/:param')
+  filter(@Param('param') param: string) {
+    return this.animeService.filter(param);
   }
 
   @Post()

@@ -3,9 +3,9 @@ import { UserModule } from './user/user.module';
 import { GroupModule } from './group/group.module';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AnimeModule } from './anime/anime.module';
-import { AnimeEpModule } from './anime-ep/anime-ep.module';
 import { AuthModule } from './auth/auth.module';
 import { DBConifg } from './core/config/config';
+import { ChatModule } from './chat/chat.module';
 
 @Module({
   imports: [
@@ -17,8 +17,8 @@ import { DBConifg } from './core/config/config';
     UserModule,
     GroupModule,
     AnimeModule,
-    AnimeEpModule,
     AuthModule,
+    ChatModule,
   ],
 })
 export class AppModule {}

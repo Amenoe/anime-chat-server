@@ -1,5 +1,6 @@
 import {
   BeforeInsert,
+  BeforeUpdate,
   Column,
   CreateDateColumn,
   Entity,
@@ -37,6 +38,7 @@ export class User {
   create_time: Date;
 
   @BeforeInsert()
+  @BeforeUpdate()
   async encryptPwd() {
     this.password = await bcrypt.hashSync(this.password);
   }

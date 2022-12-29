@@ -1,4 +1,9 @@
-import { HttpException, HttpStatus, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  HttpException,
+  HttpStatus,
+  Injectable,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { CreateUserDto } from './dto/create-user.dto';
@@ -13,15 +18,26 @@ export class UserService {
   ) {}
 
   async register(createUserDto: CreateUserDto) {
-    const { username } = createUserDto;
+    let data;
+    const { username, role } = createUserDto;
     const existUser = await this.userRepository.findOne({
       where: { username },
     });
+    const newUser = await this.userRepository.create(createUserDto);
+
+    //错误判断
     if (existUser) {
       throw new HttpException('用户名已存在', HttpStatus.BAD_REQUEST);
     }
-    const newUser = await this.userRepository.create(createUserDto);
-    return await this.userRepository.save(newUser);
+    if (role === 'root') {
+      throw new HttpException('权限不足', HttpStatus.UNAUTHORIZED);
+    }
+    try {
+      data = await this.userRepository.save(newUser);
+    } catch (error) {
+      throw new HttpException('服务器出错', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+    return data;
   }
 
   async findAll() {
@@ -38,11 +54,32 @@ export class UserService {
     return data;
   }
 
-  update(id: string, updateUserDto: UpdateUserDto) {
-    return `This action updates a #${id} user`;
+  async update(id: string, update: UpdateUserDto) {
+    console.log(update);
+    const newUser = await this.userRepository.create(update);
+    const result = await this.userRepository.update(id, newUser);
+    if (result.affected === 0) {
+      throw new BadRequestException('更新失败');
+    }
+    const data = await this.userRepository.findOne({
+      where: { user_id: id },
+    });
+    return data;
   }
 
-  remove(id: string) {
-    return `This action removes a #${id} user`;
+  async updateStatus(id: string, update: UpdateUserDto) {
+    const result = await this.userRepository.update(id, update);
+    if (result.affected === 0) {
+      throw new BadRequestException('更新失败');
+    }
+    return result;
+  }
+
+  async delete(id: string) {
+    const result = await this.userRepository.delete(id);
+    if (result.affected === 0) {
+      throw new BadRequestException('删除失败');
+    }
+    return result;
   }
 }

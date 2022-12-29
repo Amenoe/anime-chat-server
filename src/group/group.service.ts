@@ -1,9 +1,23 @@
 import { Injectable } from '@nestjs/common';
 import { CreateGroupDto } from './dto/create-group.dto';
 import { UpdateGroupDto } from './dto/update-group.dto';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Group } from './entities/group.entity';
+import { Repository } from 'typeorm';
+import { GroupUserMap } from './entities/group_user_map.entity';
+import { GroupMessage } from './entities/group_message.entity';
 
 @Injectable()
 export class GroupService {
+  constructor(
+    @InjectRepository(Group)
+    private readonly groupRepository: Repository<Group>,
+    @InjectRepository(GroupUserMap)
+    private readonly groupUserRepository: Repository<GroupUserMap>,
+    @InjectRepository(GroupMessage)
+    private readonly groupMessageRepository: Repository<GroupMessage>,
+  ) {}
+
   create(createGroupDto: CreateGroupDto) {
     return 'This action adds a new group';
   }

@@ -1,22 +1,22 @@
 import { Column, Entity, PrimaryGeneratedColumn } from 'typeorm';
 
 @Entity()
-export class Group {
+export class GroupMessage {
   @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Column()
   group_id: string;
 
-  @Column({ default: 'admin' })
+  @Column()
   user_id: string;
 
   @Column()
-  anime_id: number;
+  message: string;
 
   @Column()
-  group_name: string;
-
-  @Column({ default: '文明交流' })
-  notice: string;
+  message_type: string;
 
   @Column()
-  create_time: string;
+  time: number;
 }

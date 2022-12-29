@@ -6,19 +6,19 @@ import { User } from 'src/user/entities/user.entity';
 import { PassportModule } from '@nestjs/passport';
 import { LocalStrategy } from './local.strategy';
 import { JwtModule } from '@nestjs/jwt';
-import { UserModule } from 'src/user/user.module';
 import { jwtConfig } from 'src/core/config/config';
 import { JwtStrategy } from './jwt.strategy';
+import { UserService } from 'src/user/user.service';
 
 const jwtModule = JwtModule.register({
   secret: jwtConfig.secret,
-  signOptions: { expiresIn: '7d' }, //签名有效时间
+  signOptions: { expiresIn: '3d' }, //签名有效时间
 });
 
 @Module({
   imports: [TypeOrmModule.forFeature([User]), PassportModule, jwtModule],
   controllers: [AuthController],
-  providers: [AuthService, LocalStrategy, JwtStrategy],
+  providers: [AuthService, LocalStrategy, JwtStrategy, UserService],
   exports: [jwtModule],
 })
 export class AuthModule {}

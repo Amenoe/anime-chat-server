@@ -1,9 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { getRepository, Repository } from 'typeorm';
+import { getRepository, Like, Repository } from 'typeorm';
 import { CreateAnimeDto } from './dto/create-anime.dto';
 import { UpdateAnimeDto } from './dto/update-anime.dto';
 import { Anime } from './entities/anime.entity';
+import { AnimeEp } from './entities/anime_ep.entity';
 
 @Injectable()
 export class AnimeService {
@@ -11,71 +12,6 @@ export class AnimeService {
     @InjectRepository(Anime)
     private animeRepository: Repository<Anime>,
   ) {}
-
-  // async search(title: string, page: number) {
-  //   const searchResult = await getRepository(Anime)
-  //     .createQueryBuilder('anime')
-  //     .where('anime.title LIKE :title', { title: `%${title}%` })
-  //     .skip((page - 1) * 20)
-  //     .take(20)
-  //     .getMany();
-
-  //   const data = {
-  //     pageindex: page,
-  //     pagetotal: searchResult.length / 20,
-  //     results: searchResult,
-  //   };
-  //   // console.log(searchResult);
-  //   return data;
-  // }
-
-  // //主页数据
-  // async getIndex() {
-  //   const banners = await this.animeRepository.query(
-  //     "SELECT * FROM `anime` WHERE FIND_IN_SET('轮播',status)",
-  //   );
-  //   const bannersData = banners.map((item) => {
-  //     return {
-  //       cover: item.cover,
-  //       id: item.anime_id,
-  //       title: item.title,
-  //     };
-  //   });
-  //   const hots = await this.animeRepository.query(
-  //     "SELECT * FROM `anime` WHERE FIND_IN_SET('热门',status)",
-  //   );
-  //   const hotsData = hots.map((item) => {
-  //     return {
-  //       cover: item.cover,
-  //       id: item.anime_id,
-  //       season: item.season,
-  //       title: item.title,
-  //       date: item.pub_time,
-  //       description: item.description,
-  //     };
-  //   });
-  //   const latest = await this.animeRepository.find({
-  //     order: {
-  //       update_time: 'DESC',
-  //     },
-  //     take: 5,
-  //   });
-
-  //   const latestData = latest.map((item) => {
-  //     return {
-  //       cover: item.cover,
-  //       id: item.cover,
-  //       season: item.season,
-  //       title: item.title,
-  //     };
-  //   });
-  //   const data = {
-  //     banner: bannersData,
-  //     hots: hotsData,
-  //     latest: latestData,
-  //   };
-  //   return data;
-  // }
 
   async getIndex() {
     const banners = await this.animeRepository.query(
@@ -95,6 +31,29 @@ export class AnimeService {
       hots: hots,
       latest: latest,
     };
+    return data;
+  }
+
+  async getDetail(id: string) {
+    const data = await getRepository(Anime)
+      .createQueryBuilder('anime')
+      .leftJoinAndMapMany(
+        'anime.anime_id',
+        AnimeEp,
+        'ep',
+        'anime.anime_id = ep.anime_id',
+      )
+      .where('anime.anime_id = :id', { id })
+      .getOne();
+    return data;
+  }
+
+  async filter(param: string) {
+    const data = await this.animeRepository.find({
+      where: {
+        title: Like(`%${param}%`),
+      },
+    });
     return data;
   }
 
