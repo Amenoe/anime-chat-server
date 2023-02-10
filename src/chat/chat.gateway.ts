@@ -5,7 +5,6 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
-import { ChatService } from './chat.service';
 import { InjectRepository } from '@nestjs/typeorm';
 import { User } from 'src/user/entities/user.entity';
 import { Group } from 'src/group/entities/group.entity';
@@ -13,7 +12,6 @@ import { Repository } from 'typeorm';
 import { GroupUserMap } from 'src/group/entities/group_user_map.entity';
 import { GroupMessage } from 'src/group/entities/group_message.entity';
 import { Server, Socket } from 'socket.io';
-import { BadRequestException, HttpException } from '@nestjs/common';
 import { Anime } from 'src/anime/entities/anime.entity';
 
 @WebSocketGateway({ cors: true })
