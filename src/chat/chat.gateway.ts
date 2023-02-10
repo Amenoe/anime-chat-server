@@ -35,17 +35,21 @@ export class ChatGateway {
   server: Server;
 
   // 默认群
-  defaultGroup: string;
+  defaultGroup = 'default';
 
   // socket连接钩子
   async handleConnection(client: Socket): Promise<string> {
-    // 连接默认加入"阿童木聊天室"房间
-    client.join('default');
+    // 连接默认房间
+    client.join(this.defaultGroup);
     console.log('连接成功');
-    // 进来统计一下在线人数
-    // this.getActiveGroupUser();
 
     return '连接成功';
+  }
+
+  // socket断连钩子
+  async handleDisconnect(): Promise<any> {
+    console.log('断开连接');
+    this.getActiveGroupUser(this.defaultGroup);
   }
 
   @SubscribeMessage('addGroup')
@@ -63,8 +67,9 @@ export class ChatGateway {
       client.join(isHaveGroup.group_id);
       console.log('已连接到该群组');
       this.server.to(isHaveGroup.group_id).emit('addGroup', isHaveGroup);
-      //获取该群组的所有聊天信息
-      // this.getGroupMessage(isHaveGroup.group_id);
+      this.defaultGroup = isHaveGroup.group_id;
+      // 进来统计一下在线人数
+      this.getActiveGroupUser(isHaveGroup.group_id);
     } else {
       const animeData = await this.animeRepository.findOne({
         where: { anime_id },
@@ -75,6 +80,9 @@ export class ChatGateway {
         create_time: String(new Date().getTime()),
       });
       client.join(groupData.group_id);
+      this.defaultGroup = groupData.group_id;
+      // 进来统计一下在线人数
+      this.getActiveGroupUser(groupData.group_id);
     }
   }
 
@@ -88,14 +96,16 @@ export class ChatGateway {
         group_id,
       },
       order: {
-        time: 'ASC',
+        time: 'DESC',
       },
+      skip: 0,
       take: 10,
     });
     if (messageList.length) {
       const data1 = messageList.map(async (item) => {
         const userData = await this.userRepository.findOne(item.user_id);
         return {
+          id: item.id,
           user_id: userData.user_id,
           nickname: userData.nickname,
           message: item.message,
@@ -111,7 +121,6 @@ export class ChatGateway {
 
   @SubscribeMessage('groupMessage')
   async sendGroupMessage(@MessageBody() data: GroupMessageDto) {
-    console.log(data);
     const isUser = await this.userRepository.findOne({ user_id: data.user_id });
     if (isUser) {
       const message = await this.groupMessageRepository.save({
@@ -128,5 +137,21 @@ export class ChatGateway {
         .to(data.group_id)
         .emit('groupMessage', { message: '发送错误', code: 500 });
     }
+  }
+
+  async getActiveGroupUser(group_id: string) {
+    // const activeUser = await this.userRepository.count({
+    //   where: { status: 1 },
+    // });
+    // 从server中获取连接人数
+    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+    // @ts-ignore;
+    const activeUser = this.server.engine.clientsCount;
+    console.log('查询人数' + activeUser);
+    this.server.to(group_id).emit('activeGroupUser', {
+      data: activeUser,
+      message: '查询成功',
+      code: 200,
+    });
   }
 }
