@@ -1,6 +1,5 @@
 import {
   BeforeInsert,
-  BeforeUpdate,
   Column,
   CreateDateColumn,
   Entity,
@@ -14,7 +13,7 @@ export class User {
   @PrimaryGeneratedColumn('uuid')
   user_id: string;
 
-  @Column()
+  @Column({ unique: true })
   username: string;
 
   @Exclude()
@@ -24,22 +23,24 @@ export class User {
   @Column()
   nickname: string;
 
-  @Column()
+  @Column({ default: '/api/images/avatar(1).png' })
   avatar: string;
 
-  //管理员可以删除聊天室和用户数据
+  // 管理员可以删除聊天室和用户数据
   @Column('enum', { enum: ['root', 'user'], default: 'user' })
   role: string;
 
-  @Column()
+  @Column({ type: 'tinyint', default: 0 })
   status: number;
 
-  @CreateDateColumn({ type: 'date' })
+  @CreateDateColumn({ type: 'datetime' })
   create_time: Date;
 
+  /** 仅插入时加密；更新密码在 service 中显式 hash，避免 BeforeUpdate 二次加密 */
   @BeforeInsert()
-  @BeforeUpdate()
-  async encryptPwd() {
-    this.password = await bcrypt.hashSync(this.password);
+  encryptPwd() {
+    if (this.password) {
+      this.password = bcrypt.hashSync(this.password, 10);
+    }
   }
 }

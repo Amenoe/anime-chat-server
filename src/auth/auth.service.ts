@@ -12,16 +12,29 @@ export class AuthService {
 
   /**
    * 本地身份策略登录
-   * @param user
-   * @returns 用户信息和token
+   * @returns user_id / username / token / user（无 password）
    */
   async login(user: User) {
-    //生成token
     const token = this.jwtService.sign({
       user_id: user.user_id,
       username: user.username,
     });
-    this.userService.updateStatus(user.user_id, { status: 1 });
-    return { user_id: user.user_id, username: user.username, token };
+    await this.userService.updateStatus(user.user_id, { status: 1 });
+
+    const fresh = await this.userService.findOne(user.user_id);
+    return {
+      user_id: fresh.user_id,
+      username: fresh.username,
+      token,
+      user: {
+        user_id: fresh.user_id,
+        username: fresh.username,
+        nickname: fresh.nickname,
+        avatar: fresh.avatar,
+        role: fresh.role,
+        status: fresh.status,
+        create_time: fresh.create_time,
+      },
+    };
   }
 }

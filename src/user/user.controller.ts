@@ -9,11 +9,15 @@ import {
   ClassSerializerInterceptor,
   UseInterceptors,
   UseGuards,
+  Req,
+  UploadedFile,
+  BadRequestException,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { AuthGuard } from '@nestjs/passport';
 import { UserService } from './user.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
-import { AuthGuard } from '@nestjs/passport';
 
 @Controller('user')
 @UseInterceptors(ClassSerializerInterceptor)
@@ -22,17 +26,44 @@ export class UserController {
 
   /**
    * 注册接口
-   * @param createUserDto
    * @returns 用户信息(不包含密码)
    */
   @Post('register')
   register(@Body() createUserDto: CreateUserDto) {
     return this.userService.register(createUserDto);
   }
+
+  /**
+   * 上传头像（multipart field 名：file）
+   * 须在 :id 路由前声明；默认 memoryStorage，service 落盘
+   */
+  @UseGuards(AuthGuard('jwt'))
+  @Post('avatar')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      limits: { fileSize: 2 * 1024 * 1024 },
+    }),
+  )
+  uploadAvatar(@Req() req, @UploadedFile() file) {
+    if (!file) {
+      throw new BadRequestException('请选择头像文件');
+    }
+    return this.userService.uploadAvatar(req.user.user_id, file);
+  }
+
   @UseGuards(AuthGuard('jwt'))
   @Get()
   findAll() {
     return this.userService.findAll();
+  }
+
+  /**
+   * 修改用户在线状态（路由须在 :id 之前）
+   */
+  @UseGuards(AuthGuard('jwt'))
+  @Patch('status/:id')
+  updateStatus(@Param('id') id: string, @Body() updateUserDto: UpdateUserDto) {
+    return this.userService.updateStatus(id, updateUserDto);
   }
 
   @UseGuards(AuthGuard('jwt'))
@@ -42,10 +73,7 @@ export class UserController {
   }
 
   /**
-   * 通过id修改用户数据
-   * @param id 用户id
-   * @param updateUserDto
-   * @returns Promise
+   * 通过 id 修改用户数据（昵称/密码/头像 URL）
    */
   @UseGuards(AuthGuard('jwt'))
   @Patch(':id')
@@ -54,20 +82,7 @@ export class UserController {
   }
 
   /**
-   * 修改用户在线状态
-   * @param id
-   * @param updateUserDto
-   * @returns
-   */
-  @Patch('status/:id')
-  updateStatus(@Param('id') id: string, @Body() updateUserDto: UpdateUserDto) {
-    return this.userService.updateStatus(id, updateUserDto);
-  }
-
-  /**
-   * 通过id删除用户
-   * @param id 用户id
-   * @returns raw affected
+   * 通过 id 删除用户
    */
   @UseGuards(AuthGuard('jwt'))
   @Delete(':id')
