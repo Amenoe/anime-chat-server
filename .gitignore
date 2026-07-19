@@ -2,6 +2,11 @@
 /dist
 /node_modules
 
+# Env / secrets（本地真实配置，勿提交）
+.env
+.env.local
+.env.*.local
+
 # Logs
 logs
 *.log
