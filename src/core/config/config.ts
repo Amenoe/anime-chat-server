@@ -27,3 +27,18 @@ export const DBConifg = {
   password: required('DB_PASSWORD'),
   database: required('DB_DATABASE', 'anime_chat'),
 };
+
+/**
+ * MinIO / S3 兼容对象存储。
+ * Private 桶仍可被后端用 Access Key 读写；浏览器不能直接匿名访问。
+ */
+export const minioConfig = {
+  endPoint: process.env.MINIO_ENDPOINT || '127.0.0.1',
+  port: Number(process.env.MINIO_PORT || 9000),
+  useSSL: (process.env.MINIO_USE_SSL || 'false').toLowerCase() === 'true',
+  accessKey: required('MINIO_ACCESS_KEY', ''),
+  secretKey: required('MINIO_SECRET_KEY', ''),
+  bucket: process.env.MINIO_BUCKET || 'anime-chat',
+  /** 对象键前缀，例如 avatars/xxx.png */
+  avatarPrefix: process.env.MINIO_AVATAR_PREFIX || 'avatars',
+};

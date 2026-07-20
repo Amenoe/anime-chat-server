@@ -7,11 +7,12 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as bcrypt from 'bcryptjs';
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
-import { extname, join } from 'path';
+import { extname } from 'path';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { User } from './entities/user.entity';
+import { MinioService } from '../storage/minio.service';
+import { minioConfig } from '../core/config/config';
 
 /** multer 内存存储的文件形状（避免强依赖 @types/multer） */
 export type UploadedAvatarFile = {
@@ -36,6 +37,7 @@ export class UserService {
   constructor(
     @InjectRepository(User)
     private userRepository: Repository<User>,
+    private readonly minioService: MinioService,
   ) {}
 
   async register(createUserDto: CreateUserDto) {
@@ -51,7 +53,7 @@ export class UserService {
       username,
       password,
       nickname,
-      avatar: avatar || '/api/images/avatar(1).png',
+      avatar: avatar || '',
       role: 'user',
       status: 0,
     });
@@ -118,7 +120,8 @@ export class UserService {
   }
 
   /**
-   * 上传头像：落盘到 public/images/uploads，avatar 存可访问 URL
+   * 上传头像到 MinIO Private 桶。
+   * DB 中存后端代理路径 /api/images/avatars/xxx，前端无需直连 MinIO。
    */
   async uploadAvatar(userId: string, file?: UploadedAvatarFile) {
     if (!file?.buffer?.length) {
@@ -133,7 +136,6 @@ export class UserService {
 
     let ext = extname(file.originalname || '').toLowerCase();
     if (!AVATAR_EXT.has(ext)) {
-      // 从 mime 推断扩展名
       const map: Record<string, string> = {
         'image/jpeg': '.jpg',
         'image/jpg': '.jpg',
@@ -151,21 +153,28 @@ export class UserService {
       throw new BadRequestException('用户不存在');
     }
 
-    const uploadDir = join(
-      process.cwd(),
-      'src',
-      'public',
-      'images',
-      'uploads',
-    );
-    if (!existsSync(uploadDir)) {
-      mkdirSync(uploadDir, { recursive: true });
+    const filename = `${userId.slice(0, 8)}-${Date.now()}${ext}`;
+    const objectName = `${minioConfig.avatarPrefix}/${filename}`;
+
+    await this.minioService.putObject({
+      objectName,
+      buffer: file.buffer,
+      contentType: file.mimetype,
+    });
+
+    // 尽量清理旧的 MinIO 头像（本地静态默认图不删）
+    const old = exist.avatar || '';
+    const marker = '/api/images/avatars/';
+    if (old.startsWith(marker)) {
+      const oldName = old.slice(marker.length).split('?')[0];
+      if (oldName && oldName !== filename) {
+        await this.minioService.removeObject(
+          `${minioConfig.avatarPrefix}/${oldName}`,
+        );
+      }
     }
 
-    const filename = `${userId.slice(0, 8)}-${Date.now()}${ext}`;
-    writeFileSync(join(uploadDir, filename), file.buffer);
-
-    const avatar = `/api/images/uploads/${filename}`;
+    const avatar = `/api/images/avatars/${filename}`;
     await this.userRepository.update(userId, { avatar });
     return await this.findOne(userId);
   }

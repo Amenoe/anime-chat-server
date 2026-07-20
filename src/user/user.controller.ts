@@ -14,6 +14,11 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+// multer 为 @nestjs/platform-express 传递依赖；无 @types/multer 时用 require
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { memoryStorage } = require('multer') as {
+  memoryStorage: () => unknown;
+};
 import { AuthGuard } from '@nestjs/passport';
 import { UserService } from './user.service';
 import { CreateUserDto } from './dto/create-user.dto';
@@ -35,13 +40,27 @@ export class UserController {
 
   /**
    * 上传头像（multipart field 名：file）
-   * 须在 :id 路由前声明；默认 memoryStorage，service 落盘
+   * 须在 :id 路由前声明；memoryStorage 后由 service 上传到 MinIO
    */
   @UseGuards(AuthGuard('jwt'))
   @Post('avatar')
   @UseInterceptors(
     FileInterceptor('file', {
+      storage: memoryStorage(),
       limits: { fileSize: 2 * 1024 * 1024 },
+      fileFilter: (_req, file, cb) => {
+        const ok = [
+          'image/jpeg',
+          'image/jpg',
+          'image/png',
+          'image/gif',
+          'image/webp',
+        ].includes(file.mimetype);
+        cb(
+          ok ? null : new BadRequestException('仅支持 jpg/png/gif/webp 图片'),
+          ok,
+        );
+      },
     }),
   )
   uploadAvatar(@Req() req, @UploadedFile() file) {

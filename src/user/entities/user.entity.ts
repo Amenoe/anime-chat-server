@@ -23,7 +23,7 @@ export class User {
   @Column()
   nickname: string;
 
-  @Column({ default: '/api/images/avatar(1).png' })
+  @Column({ default: '' })
   avatar: string;
 
   // 管理员可以删除聊天室和用户数据

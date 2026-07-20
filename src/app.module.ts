@@ -7,6 +7,7 @@ import { AuthModule } from './auth/auth.module';
 import { DBConifg } from './core/config/config';
 import { ChatModule } from './chat/chat.module';
 import { UserAnimeModule } from './user-anime/user-anime.module';
+import { StorageModule } from './storage/storage.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { UserAnimeModule } from './user-anime/user-anime.module';
       // 开发环境自动同步表结构；生产请改为 false 并走迁移/schema.sql
       synchronize: true,
     }),
+    StorageModule,
     UserModule,
     GroupModule,
     AnimeModule,
