@@ -15,11 +15,7 @@ import { Anime } from 'src/anime/entities/anime.entity';
 import { Group } from 'src/group/entities/group.entity';
 import { GroupUserMap } from 'src/group/entities/group_user_map.entity';
 import { GroupMessage } from 'src/group/entities/group_message.entity';
-import {
-  AddGroupDto,
-  GroupMessageDto,
-  GroupMessageView,
-} from './dto/chat.dto';
+import { AddGroupDto, GroupMessageDto, GroupMessageView } from './dto/chat.dto';
 
 const HISTORY_LIMIT = 50;
 
@@ -29,9 +25,7 @@ type SocketMeta = {
 };
 
 @WebSocketGateway({ cors: true })
-export class ChatGateway
-  implements OnGatewayConnection, OnGatewayDisconnect
-{
+export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   constructor(
     @InjectRepository(User)
     private readonly userRepository: Repository<User>,
@@ -99,19 +93,14 @@ export class ChatGateway
         where: { anime_id },
       });
       const name =
-        group_name?.trim() ||
-        animeData?.title ||
-        `番剧 #${anime_id}`;
+        group_name?.trim() || animeData?.title || `番剧 #${anime_id}`;
 
       group = await this.groupRepository.save({
         anime_id,
         group_name: name,
         create_time: String(Date.now()),
       });
-    } else if (
-      group_name?.trim() &&
-      group.group_name.startsWith('番剧 #')
-    ) {
+    } else if (group_name?.trim() && group.group_name.startsWith('番剧 #')) {
       group.group_name = group_name.trim();
       await this.groupRepository.save(group);
     }
@@ -315,9 +304,7 @@ export class ChatGateway
     if (!room) return 0;
 
     const socketIds: string[] =
-      typeof room.forEach === 'function'
-        ? Array.from(room as Set<string>)
-        : [];
+      typeof room.forEach === 'function' ? Array.from(room as Set<string>) : [];
 
     const users = new Set<string>();
     for (const sid of socketIds) {
