@@ -12,6 +12,8 @@ import { basename, isAbsolute, join, resolve } from 'path';
 import { Repository } from 'typeorm';
 import { playbackConfig, qbittorrentConfig } from '../core/config/config';
 import { outboundGet } from '../core/http/outbound';
+import { Group } from '../group/entities/group.entity';
+import { GroupUserMap } from '../group/entities/group_user_map.entity';
 import { CreatePlaybackDto } from './dto/create-playback.dto';
 import { AutoPlaybackDto } from './dto/auto-playback.dto';
 import { StreamPlaybackDto } from './dto/stream-playback.dto';
@@ -32,6 +34,10 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
   constructor(
     @InjectRepository(PlaybackSession)
     private readonly sessionRepo: Repository<PlaybackSession>,
+    @InjectRepository(Group)
+    private readonly groupRepo: Repository<Group>,
+    @InjectRepository(GroupUserMap)
+    private readonly groupUserMapRepo: Repository<GroupUserMap>,
     private readonly qb: QbittorrentService,
     private readonly sourceSearch: SourceSearchService,
   ) {}
@@ -131,6 +137,7 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
 
     const session = this.sessionRepo.create({
       user_id: userId,
+      group_id: dto.groupId || '',
       bangumi_id: dto.bangumiId ?? null,
       episode_sort: dto.episodeSort ?? null,
       source_uri: url,
@@ -175,6 +182,7 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
 
     const session = this.sessionRepo.create({
       user_id: userId,
+      group_id: dto.groupId || '',
       bangumi_id: dto.bangumiId ?? null,
       episode_sort: dto.episodeSort ?? null,
       source_uri: uri,
@@ -385,10 +393,23 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
 
   private async findOwned(id: string, userId: string) {
     const session = await this.sessionRepo.findOne({ where: { id } });
-    if (!session || session.user_id !== userId) {
-      throw new NotFoundException('播放会话不存在');
+    if (!session) throw new NotFoundException('播放会话不存在');
+
+    if (session.user_id === userId) return session;
+
+    if (session.group_id) {
+      const group = await this.groupRepo.findOne({
+        where: { group_id: session.group_id },
+      });
+      if (group && group.host_user_id === userId) return session;
+
+      const membership = await this.groupUserMapRepo.findOne({
+        where: { group_id: session.group_id, user_id: userId },
+      });
+      if (membership) return session;
     }
-    return session;
+
+    throw new NotFoundException('播放会话不存在');
   }
 
   private async pollActiveSessions() {

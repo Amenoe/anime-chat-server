@@ -29,4 +29,8 @@ export class StreamPlaybackDto {
 
   @IsOptional()
   episodeSort?: number;
+
+  @IsOptional()
+  @IsString()
+  groupId?: string;
 }

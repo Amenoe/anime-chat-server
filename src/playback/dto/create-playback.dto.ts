@@ -17,4 +17,8 @@ export class CreatePlaybackDto {
   @IsInt()
   @Min(0)
   fileIndex?: number;
+
+  @IsOptional()
+  @IsString()
+  groupId?: string;
 }
