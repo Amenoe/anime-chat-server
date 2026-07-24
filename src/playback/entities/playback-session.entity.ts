@@ -26,6 +26,9 @@ export class PlaybackSession {
   @Column({ type: 'varchar', length: 36 })
   user_id: string;
 
+  @Column({ type: 'varchar', length: 36, default: '' })
+  group_id: string;
+
   @Column({ type: 'int', nullable: true })
   bangumi_id: number | null;
 
