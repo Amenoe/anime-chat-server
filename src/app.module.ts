@@ -10,6 +10,7 @@ import { UserAnimeModule } from './user-anime/user-anime.module';
 import { StorageModule } from './storage/storage.module';
 import { PlaybackModule } from './playback/playback.module';
 import { MediaSourceModule } from './media-source/media-source.module';
+import { RoomModule } from './room/room.module';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { MediaSourceModule } from './media-source/media-source.module';
     UserAnimeModule,
     MediaSourceModule,
     PlaybackModule,
+    RoomModule,
   ],
 })
 export class AppModule {}
