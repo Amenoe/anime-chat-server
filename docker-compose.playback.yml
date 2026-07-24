@@ -1,10 +1,12 @@
-# 播放相关依赖：qBittorrent（BT 下载）
-# 用法（在服务器或本机）：
-#   cd anime-chat-server && docker compose -f docker-compose.playback.yml up -d
-# 云服务器：与 Nest 同机 Docker 即可，无需 apt 安装 qBittorrent 桌面版
+# 生产可选：qBittorrent（BT 下载）
+# 本地测试不需要；直接把视频放进 MEDIA_ROOT 即可播
 #
-# WebUI: http://<host>:8085  默认账号 admin / adminadmin（首次登录后请立刻改密）
-# Nest 通过 QB_URL=http://127.0.0.1:8085 调用 Web API
+#   mkdir -p data/bt-downloads
+#   docker compose -f docker-compose.playback.yml up -d
+#
+# WebUI http://<host>:8085
+# .env.production: QB_ENABLED=true  MEDIA_ROOT=./data/bt-downloads
+# 卷须与 MEDIA_ROOT 指向同一宿主机目录
 
 services:
   qbittorrent:
@@ -15,15 +17,12 @@ services:
       - PGID=1000
       - TZ=Asia/Shanghai
       - WEBUI_PORT=8085
-      # 首次启动默认密码见容器日志；也可在 .env 用 QB_* 覆盖后由运维改密
     volumes:
-      # 配置与 BT 下载目录（云服务器务必挂到大磁盘）
       - qb-config:/config
-      # 与 Nest QB_DOWNLOAD_PATH=./data/bt-downloads 对齐，便于读本地文件出流
       - ./data/bt-downloads:/downloads
     ports:
-      - '8085:8085' # WebUI + Web API
-      - '6881:6881' # BT TCP
+      - '8085:8085'
+      - '6881:6881'
       - '6881:6881/udp'
     restart: unless-stopped
 

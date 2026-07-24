@@ -2,64 +2,45 @@
 
 `nest.js` `typeorm` `jwt` `socket.io`
 
-- 本人毕业设计 `动漫聊天室` 的后端，使用 `nest.js` 框架开发
-
-- 使用 `jwt` 进行用户身份认证
-
-- 使用 `socket.io`库 进行客户端和服务器之间通信
-
 ---
 
-## 本地配置（数据库 / JWT）
+## 环境
 
-密钥**不要**写进 `src/` 源码。复制示例环境文件后填写：
-
-```bash
-cp .env.example .env
-# 编辑 .env：DB_PASSWORD、JWT_SECRET 等
-pnpm start:dev
-```
+| 环境 | 文件 | 启动 |
+|------|------|------|
+| 开发 | `.env.development` | `pnpm start:dev` |
+| 生产 | `.env.production` | `pnpm start:prod` |
 
 | 变量 | 说明 |
 |------|------|
-| `DB_HOST` / `DB_PORT` | MySQL 地址，默认 `localhost:3306` |
-| `DB_USERNAME` / `DB_PASSWORD` | 账号密码 |
-| `DB_DATABASE` | 库名，默认 `anime_chat` |
-| `JWT_SECRET` | JWT 签名密钥 |
-| `MINIO_ENDPOINT` / `MINIO_PORT` | MinIO 地址，默认 `127.0.0.1:9000` |
-| `MINIO_USE_SSL` | 是否 HTTPS，默认 `false` |
-| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | Access Key（Private 桶） |
-| `MINIO_BUCKET` | 桶名，默认 `anime-chat` |
-| `MINIO_AVATAR_PREFIX` | 头像对象前缀，默认 `avatars` |
-| `MINIO_PLAYBACK_PREFIX` | 播放缓存前缀，默认 `playback` |
-| `QB_ENABLED` / `QB_URL` | qBittorrent Web API |
-| `QB_USERNAME` / `QB_PASSWORD` | qB WebUI 账号 |
-| `QB_DOWNLOAD_PATH` | 宿主机下载目录（与 Docker `/downloads` 挂载一致） |
+| `DB_*` / `JWT_SECRET` | MySQL / JWT |
+| `MINIO_*` | 头像对象存储 |
+| `QB_*` | qBittorrent（BT 边下边播） |
+| `OUTBOUND_PROXY` | **可选**。搜源在浏览器完成，服务器通常不需要；仅运维代拉时配置 |
 
-头像存 MinIO Private 桶，前端通过 `GET /api/images/avatars/:filename` 代理读取；上传接口为 `POST /api/user/avatar`（multipart field：`file`，需 JWT）。
+## 数据源
 
-`.env` 已在 `.gitignore` 中；仓库只保留无密钥的 `.env.example`。
+个人中心「数据源」：订阅 JSON（Animeko 格式）。默认：
 
-## 播放（BT / 磁力 → 流媒体）
+- `https://sub.creamycake.org/v1/css1.json` — 流媒体
+- `https://sub.creamycake.org/v1/bt1.json` — BT RSS
 
-**qBittorrent 需要在「Nest 能访问到的机器」上运行。** 云服务器推荐用 Docker（不必 `apt install` 桌面版）：
+**订阅拉取与搜源在用户浏览器执行**（走用户自己的网络 / 代理）。服务器只保存订阅 URL，并在用户选定资源后：
 
-```bash
-# 与 Nest 同机
-mkdir -p data/bt-downloads
-docker compose -f docker-compose.playback.yml up -d
-# WebUI http://服务器IP:8085  首次登录后改密，并同步到 .env 的 QB_PASSWORD
+1. **流媒体**：`POST /api/playback/sessions/stream` → 代理 Range 出流  
+2. **BT**：`POST /api/playback/sessions` magnet → qB 边下边播  
+
+## 播放 API
+
+```http
+POST /api/playback/sessions/stream   # 直链
+POST /api/playback/sessions          # magnet / torrent
+GET  /api/playback/sessions/:id/stream?token=
+GET  /api/media-sources              # 用户订阅列表
 ```
 
-架构简述：
-
-1. `POST /api/playback/sessions`（JWT）提交 magnet / 种子 URL  
-2. Nest 调 qBittorrent Web API 下载到 `QB_DOWNLOAD_PATH`  
-3. 进度达标后 `playUrl` 指向 `GET /api/playback/sessions/:id/stream?token=`（支持 Range）  
-4. 下载完成后异步上传 MinIO `playback/` 前缀作二次缓存  
-
-未部署 qB 时设 `QB_ENABLED=false`，其它接口不受影响。
+BT 需 `QB_ENABLED=true` + docker-compose.playback.yml。
 
 ---
 
-前端跳转至 [anime-chat](https://github.com/Amenoe/anime-chat)
+前端：[anime-chat](https://github.com/Amenoe/anime-chat)

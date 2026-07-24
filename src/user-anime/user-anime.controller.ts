@@ -38,10 +38,7 @@ export class UserAnimeController {
   }
 
   @Get(':bangumiId')
-  findOne(
-    @Req() req,
-    @Param('bangumiId', ParseIntPipe) bangumiId: number,
-  ) {
+  findOne(@Req() req, @Param('bangumiId', ParseIntPipe) bangumiId: number) {
     return this.userAnimeService.findOne(req.user.user_id, bangumiId);
   }
 
@@ -55,10 +52,7 @@ export class UserAnimeController {
   }
 
   @Delete(':bangumiId')
-  remove(
-    @Req() req,
-    @Param('bangumiId', ParseIntPipe) bangumiId: number,
-  ) {
+  remove(@Req() req, @Param('bangumiId', ParseIntPipe) bangumiId: number) {
     return this.userAnimeService.remove(req.user.user_id, bangumiId);
   }
 }

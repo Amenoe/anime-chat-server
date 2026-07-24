@@ -1,9 +1,9 @@
 import { IsInt, IsOptional, IsString, Min, MinLength } from 'class-validator';
 
 export class CreatePlaybackDto {
-  /** magnet:?xt=... 或 http(s)://.../*.torrent */
+  /** magnet:?xt=... 或 http(s) 种子 / 直链 */
   @IsString()
-  @MinLength(10)
+  @MinLength(8)
   uri: string;
 
   @IsOptional()
@@ -13,7 +13,6 @@ export class CreatePlaybackDto {
   @IsOptional()
   episodeSort?: number;
 
-  /** 多文件种子时指定文件序号；不传则自动选最大视频文件 */
   @IsOptional()
   @IsInt()
   @Min(0)

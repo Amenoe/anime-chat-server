@@ -7,7 +7,7 @@ import {
   MinLength,
 } from 'class-validator';
 
-/** 按番名+集数自动搜磁力并创建播放会话 */
+/** 按番名+集数：数据源搜索 → 优先流媒体，否则 BT */
 export class AutoPlaybackDto {
   /** 主搜索关键词（一般为中文名） */
   @IsString()

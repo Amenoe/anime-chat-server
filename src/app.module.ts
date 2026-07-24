@@ -9,6 +9,7 @@ import { ChatModule } from './chat/chat.module';
 import { UserAnimeModule } from './user-anime/user-anime.module';
 import { StorageModule } from './storage/storage.module';
 import { PlaybackModule } from './playback/playback.module';
+import { MediaSourceModule } from './media-source/media-source.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { PlaybackModule } from './playback/playback.module';
     AuthModule,
     ChatModule,
     UserAnimeModule,
+    MediaSourceModule,
     PlaybackModule,
   ],
 })

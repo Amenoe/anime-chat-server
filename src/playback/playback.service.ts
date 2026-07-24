@@ -10,32 +10,30 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { createReadStream, existsSync, statSync } from 'fs';
 import { basename, isAbsolute, join, resolve } from 'path';
 import { Repository } from 'typeorm';
-import {
-  minioConfig,
-  playbackConfig,
-  qbittorrentConfig,
-} from '../core/config/config';
-import { MinioService } from '../storage/minio.service';
+import { playbackConfig, qbittorrentConfig } from '../core/config/config';
+import { outboundGet } from '../core/http/outbound';
 import { CreatePlaybackDto } from './dto/create-playback.dto';
 import { AutoPlaybackDto } from './dto/auto-playback.dto';
+import { StreamPlaybackDto } from './dto/stream-playback.dto';
 import {
   PlaybackSession,
   PlaybackStatus,
 } from './entities/playback-session.entity';
 import { QbittorrentService } from './qbittorrent.service';
-import { MagnetSearchService } from './magnet-search.service';
+import { PlayCandidate, SourceSearchService } from './source-search.service';
 
 @Injectable()
 export class PlaybackService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(PlaybackService.name);
   private timer: NodeJS.Timeout | null = null;
+  /** sessionId → 流媒体源请求头 */
+  private streamHeaders = new Map<string, Record<string, string>>();
 
   constructor(
     @InjectRepository(PlaybackSession)
     private readonly sessionRepo: Repository<PlaybackSession>,
     private readonly qb: QbittorrentService,
-    private readonly minio: MinioService,
-    private readonly magnetSearch: MagnetSearchService,
+    private readonly sourceSearch: SourceSearchService,
   ) {}
 
   onModuleInit() {
@@ -52,51 +50,128 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
 
   async qbHealth() {
     if (!this.qb.isEnabled()) {
-      return { ok: false, message: 'QB_ENABLED=false' };
+      return { ok: false, message: 'QB_ENABLED=false（BT 播放不可用）' };
     }
     return this.qb.healthCheck();
   }
 
-  /**
-   * 按关键词+集数搜磁力，并创建播放会话（一键点集播放）
-   */
-  async createFromEpisode(userId: string, dto: AutoPlaybackDto) {
-    this.qb.assertEnabled();
-    const best = await this.magnetSearch.pickBest({
-      keyword: dto.keyword,
-      episodeSort: dto.episodeSort,
-      altKeywords: dto.altKeyword ? [dto.altKeyword] : [],
-    });
-    if (!best) {
-      throw new BadRequestException(
-        `未找到「${dto.keyword}」第 ${dto.episodeSort} 话的磁力资源，可手动粘贴 magnet`,
-      );
-    }
-    this.logger.log(
-      `auto magnet: ep=${dto.episodeSort} score=${best.score} ${best.title}`,
-    );
-    return this.create(userId, {
-      uri: best.uri,
-      bangumiId: dto.bangumiId,
-      episodeSort: dto.episodeSort,
-      fileIndex: dto.fileIndex,
-    });
-  }
-
-  async searchMagnets(keyword: string, episodeSort: number, alt?: string) {
-    return this.magnetSearch.searchForEpisode({
+  /** 从用户数据源搜索 BT + 流媒体候选 */
+  async searchSources(
+    userId: string,
+    keyword: string,
+    episodeSort: number,
+    alt?: string,
+  ): Promise<PlayCandidate[]> {
+    return this.sourceSearch.search({
+      userId,
       keyword,
       episodeSort,
       altKeywords: alt ? [alt] : [],
     });
   }
 
+  /** 单站点搜索（抽屉） */
+  async searchOneSource(
+    _userId: string,
+    body: {
+      factoryId: string;
+      name: string;
+      searchConfig: Record<string, any>;
+      keyword: string;
+      episodeSort: number;
+      altKeyword?: string;
+      subscriptionName?: string;
+    },
+  ): Promise<PlayCandidate[]> {
+    return this.sourceSearch.searchOne(body);
+  }
+
+  /**
+   * 兼容旧 auto：服务端代搜（可能受机房网络限制）。
+   * 推荐前端在浏览器搜源后调用 sessions/stream 或 sessions。
+   */
+  async createFromEpisode(userId: string, dto: AutoPlaybackDto) {
+    const { stream, bt } = await this.sourceSearch.pickBest({
+      userId,
+      keyword: dto.keyword,
+      episodeSort: dto.episodeSort,
+      altKeywords: dto.altKeyword ? [dto.altKeyword] : [],
+    });
+
+    if (stream && /^https?:\/\//i.test(stream.uri)) {
+      return this.createFromStream(userId, {
+        streamUrl: stream.uri,
+        title: stream.title,
+        headers: stream.headers,
+        bangumiId: dto.bangumiId,
+        episodeSort: dto.episodeSort,
+      });
+    }
+
+    if (bt) {
+      return this.create(userId, {
+        uri: bt.uri,
+        bangumiId: dto.bangumiId,
+        episodeSort: dto.episodeSort,
+        fileIndex: dto.fileIndex,
+      });
+    }
+
+    throw new BadRequestException(
+      `服务端未找到资源。请使用前端浏览器搜源（走用户网络），或手动粘贴 magnet / 直链`,
+    );
+  }
+
+  /** 流媒体直链会话：立即 ready，stream 走后端代理 */
+  async createFromStream(userId: string, dto: StreamPlaybackDto) {
+    const url = (dto.streamUrl || '').trim();
+    if (!/^https?:\/\//i.test(url)) {
+      throw new BadRequestException('streamUrl 须为 http(s) 地址');
+    }
+
+    const session = this.sessionRepo.create({
+      user_id: userId,
+      bangumi_id: dto.bangumiId ?? null,
+      episode_sort: dto.episodeSort ?? null,
+      source_uri: url,
+      status: 'ready',
+      file_index: 0,
+      file_name: dto.title || basename(url.split('?')[0]) || 'stream',
+      local_path: '',
+      size_bytes: '0',
+      downloaded_bytes: '0',
+      progress: 1,
+      info_hash: '',
+      minio_object: '',
+    });
+    await this.sessionRepo.save(session);
+
+    if (dto.headers && Object.keys(dto.headers).length) {
+      this.streamHeaders.set(session.id, dto.headers);
+    }
+    return this.toView(session, 'stream');
+  }
+
   async create(userId: string, dto: CreatePlaybackDto) {
-    this.qb.assertEnabled();
     const uri = (dto.uri || '').trim();
     if (!uri.startsWith('magnet:') && !/^https?:\/\//i.test(uri)) {
-      throw new BadRequestException('uri 须为 magnet: 或 http(s) 种子链接');
+      throw new BadRequestException('uri 须为 magnet: 或 http(s) 种子/直链');
     }
+
+    // 直链视频 → 流媒体通道
+    if (
+      /^https?:\/\//i.test(uri) &&
+      this.looksLikeMedia(uri) &&
+      !/\.torrent(\?|$)/i.test(uri)
+    ) {
+      return this.createFromStream(userId, {
+        streamUrl: uri,
+        bangumiId: dto.bangumiId,
+        episodeSort: dto.episodeSort,
+      });
+    }
+
+    this.qb.assertEnabled();
 
     const session = this.sessionRepo.create({
       user_id: userId,
@@ -113,7 +188,6 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       session.info_hash = hash;
       session.status = 'downloading';
 
-      // 等待 metadata
       let files = await this.qb.getFiles(hash);
       for (let i = 0; i < 20 && !files.length; i++) {
         await this.sleep(1500);
@@ -123,7 +197,7 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
         throw new BadRequestException('种子无文件列表（metadata 超时）');
       }
 
-      let file =
+      const file =
         dto.fileIndex != null
           ? files.find((f) => f.index === dto.fileIndex)
           : this.qb.pickBestVideoFile(files);
@@ -135,7 +209,7 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       session.file_index = file.index;
       session.file_name = file.name;
       session.size_bytes = String(file.size);
-      session.local_path = this.resolveLocalPath(hash, file.name);
+      session.local_path = this.resolveLocalPath(file.name);
       await this.sessionRepo.save(session);
     } catch (e) {
       session.status = 'failed';
@@ -145,14 +219,14 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       throw e;
     }
 
-    return this.toView(session);
+    return this.toView(session, 'progressive');
   }
 
   async getSession(id: string, userId: string) {
     const session = await this.findOwned(id, userId);
-    // 同步一次进度
     await this.refreshOne(session);
-    return this.toView(session);
+    const mode = this.isStreamSession(session) ? 'stream' : 'progressive';
+    return this.toView(session, mode);
   }
 
   async listFiles(id: string, userId: string) {
@@ -162,7 +236,9 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * 打开可读流（支持 Range）。优先本地 BT 目录，其次 MinIO。
+   * 出流：
+   * 1) 流媒体：代理远端 URL（Range）
+   * 2) BT：本地 qB 目录 Range
    */
   async openStream(
     id: string,
@@ -182,6 +258,11 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     if (session.status === 'failed') {
       throw new BadRequestException(session.error_message || '播放失败');
     }
+
+    if (this.isStreamSession(session)) {
+      return this.openRemoteStream(session, rangeHeader);
+    }
+
     if (
       session.status !== 'playable' &&
       session.status !== 'ready' &&
@@ -190,61 +271,116 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException('资源尚未可播，请稍候');
     }
 
-    // 出流优先级：本地 BT 目录（边下边播）→ MinIO 完整缓存（二次播放/清盘后）
     const local = session.local_path;
-    if (local && existsSync(local)) {
-      const st = statSync(local);
-      const size = st.size;
-      if (size < 1024) {
-        throw new BadRequestException('文件过小，仍在缓冲');
-      }
-      // 边下边播：至少达到阈值
-      if (
-        session.status === 'downloading' &&
-        size < playbackConfig.playableMinBytes
-      ) {
-        throw new BadRequestException('缓冲不足，请稍候');
-      }
-
-      return this.buildRangeFromSize(
-        size,
-        rangeHeader,
-        (start, end) => createReadStream(local, { start, end }),
-        this.guessContentType(session.file_name),
-      );
+    if (!local || !existsSync(local)) {
+      throw new BadRequestException('文件尚未落地，请稍候');
     }
 
-    if (session.minio_object) {
-      const stat = await this.minio.getObjectStat(session.minio_object);
-      const size = stat.size || 0;
-      if (!size) {
-        throw new BadRequestException('MinIO 对象大小为 0');
-      }
-      // 完整对象支持 Range（getPartialObject）
+    const st = statSync(local);
+    const size = st.size;
+    if (size < 1024) {
+      throw new BadRequestException('文件过小，仍在缓冲');
+    }
+    if (
+      session.status === 'downloading' &&
+      size < playbackConfig.playableMinBytes
+    ) {
+      throw new BadRequestException('缓冲不足，请稍候');
+    }
+
+    return this.buildRangeFromSize(
+      size,
+      rangeHeader,
+      (start, end) => createReadStream(local, { start, end }),
+      this.guessContentType(session.file_name),
+    );
+  }
+
+  private async openRemoteStream(
+    session: PlaybackSession,
+    rangeHeader?: string,
+  ) {
+    const url = session.source_uri;
+    const extra = this.streamHeaders.get(session.id) || {};
+    const headers: Record<string, string> = {
+      'User-Agent':
+        extra['User-Agent'] ||
+        extra['userAgent'] ||
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      ...extra,
+    };
+    if (rangeHeader) headers.Range = rangeHeader;
+
+    try {
+      const res = await outboundGet(url, {
+        responseType: 'stream',
+        headers,
+        timeout: 60000,
+        maxRedirects: 5,
+        validateStatus: (s) => s >= 200 && s < 400,
+      });
+
+      const contentType =
+        (res.headers['content-type'] as string) ||
+        this.guessContentType(session.file_name || url);
+      const contentLength = parseInt(
+        String(res.headers['content-length'] || '0'),
+        10,
+      );
+      const contentRange = String(res.headers['content-range'] || '');
+      const partial = res.status === 206 || !!contentRange;
+
       let start = 0;
-      let end = size - 1;
-      let partial = false;
-      if (rangeHeader) {
-        const parsed = this.parseRange(rangeHeader, size);
+      let end = contentLength > 0 ? contentLength - 1 : 0;
+      let size = contentLength;
+
+      if (contentRange) {
+        const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/.exec(contentRange);
+        if (m) {
+          start = parseInt(m[1], 10);
+          end = parseInt(m[2], 10);
+          if (m[3] !== '*') size = parseInt(m[3], 10);
+          else size = end + 1;
+        }
+      } else if (rangeHeader && contentLength > 0) {
+        const parsed = this.parseRange(rangeHeader, contentLength);
         start = parsed.start;
         end = parsed.end;
-        partial = parsed.partial;
       }
-      const length = end - start + 1;
-      const stream = partial
-        ? await this.minio.getObjectPartial(session.minio_object, start, length)
-        : await this.minio.getObjectStream(session.minio_object);
+
       return {
-        stream,
-        contentType: this.guessContentType(session.file_name),
-        size,
+        stream: res.data as NodeJS.ReadableStream,
+        contentType,
+        size: size || 0,
         start,
         end,
         partial,
       };
+    } catch (e) {
+      this.logger.warn(
+        `remote stream ${session.id}: ${e instanceof Error ? e.message : e}`,
+      );
+      throw new BadRequestException(
+        '拉流失败：源站不可达或需要特殊鉴权，可换源或改用 BT',
+      );
     }
+  }
 
-    throw new BadRequestException('文件尚未落地，请稍候');
+  private isStreamSession(session: PlaybackSession) {
+    return (
+      !session.info_hash &&
+      /^https?:\/\//i.test(session.source_uri || '') &&
+      !/\.torrent(\?|$)/i.test(session.source_uri || '')
+    );
+  }
+
+  private looksLikeMedia(url: string) {
+    return (
+      /\.(mp4|m3u8|mkv|webm|m4v|flv|ts)(\?|$)/i.test(url) ||
+      /m3u8|bilivideo|akamaized|cloudflarestorage|tos-cn|sign\.bytetos/i.test(
+        url,
+      )
+    );
   }
 
   private async findOwned(id: string, userId: string) {
@@ -277,30 +413,26 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async refreshOne(session: PlaybackSession) {
-    if (!session.info_hash) return session;
-    // 默认同机：ready 后只认本地路径，不必等 MinIO
-    if (
-      session.status === 'ready' &&
-      (!playbackConfig.uploadToMinio || session.minio_object)
-    ) {
-      return session;
-    }
-
-    const info = await this.qb.getTorrent(session.info_hash);
-    if (!info) {
-      // 种已从 qB 删除：仅当开启 MinIO 备份且已上传时仍可播
-      if (session.minio_object) {
+    if (this.isStreamSession(session)) {
+      if (session.status !== 'ready') {
         session.status = 'ready';
+        session.progress = 1;
         await this.sessionRepo.save(session);
       }
       return session;
     }
 
+    if (!session.info_hash) return session;
+    if (session.status === 'ready') return session;
+    if (!this.qb.isEnabled()) return session;
+
+    const info = await this.qb.getTorrent(session.info_hash);
+    if (!info) return session;
+
     session.progress = info.progress ?? 0;
     session.downloaded_bytes = String(info.downloaded ?? 0);
     if (info.size) session.size_bytes = String(info.size);
 
-    // 同机：容器 /downloads → 宿主机 QB_DOWNLOAD_PATH（DB 存 local_path）
     session.local_path = this.resolveLocalPath(
       session.file_name,
       info.save_path,
@@ -319,16 +451,6 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     if (info.progress >= 0.999) {
       session.status = 'ready';
       await this.sessionRepo.save(session);
-      // 可选：再拷一份到 MinIO（默认关，避免双份存储）
-      if (playbackConfig.uploadToMinio) {
-        this.uploadToMinio(session).catch((e) =>
-          this.logger.warn(
-            `minio upload ${session.id}: ${
-              e instanceof Error ? e.message : e
-            }`,
-          ),
-        );
-      }
       return session;
     }
 
@@ -342,51 +464,6 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     return session;
   }
 
-  /**
-   * 可选：下载完成后上传 MinIO（PLAYBACK_UPLOAD_TO_MINIO=true）。
-   * 默认同机部署不调用——直接用 qB 落盘路径出流。
-   */
-  private async uploadToMinio(session: PlaybackSession) {
-    if (!playbackConfig.uploadToMinio) return;
-    if (session.minio_object) return;
-    if (!session.local_path || !existsSync(session.local_path)) {
-      this.logger.warn(
-        `skip minio upload ${session.id}: local missing ${session.local_path}`,
-      );
-      return;
-    }
-    const st = statSync(session.local_path);
-    if (st.size < 1024) return;
-
-    const safeName = basename(session.file_name || 'video.bin').replace(
-      /[^a-zA-Z0-9._\-一-鿿]/g,
-      '_',
-    );
-    const objectName = `${minioConfig.playbackPrefix}/${
-      session.info_hash || session.id
-    }/${safeName}`;
-
-    const exists = await this.minio.objectExists(objectName);
-    if (!exists) {
-      this.logger.log(
-        `upload to MinIO: ${session.local_path} -> ${objectName}`,
-      );
-      await this.minio.fPutObject(
-        objectName,
-        session.local_path,
-        this.guessContentType(session.file_name),
-      );
-    }
-    session.minio_object = objectName;
-    await this.sessionRepo.save(session);
-  }
-
-  /**
-   * 同机路径映射：
-   * - qB 容器内 save_path 一般为 /downloads
-   * - compose: ./data/bt-downloads:/downloads
-   * - Nest QB_DOWNLOAD_PATH 指向同一宿主机目录
-   */
   private resolveLocalPath(
     fileName: string,
     savePath?: string,
@@ -394,8 +471,11 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
   ) {
     const hostRoot = resolve(qbittorrentConfig.downloadPath);
 
-    // content_path 有时是完整文件路径（单文件种子）
-    if (contentPath && contentPath.includes('/') && !contentPath.endsWith('/')) {
+    if (
+      contentPath &&
+      contentPath.includes('/') &&
+      !contentPath.endsWith('/')
+    ) {
       const mapped = this.mapContainerPathToHost(contentPath, hostRoot);
       if (mapped && existsSync(mapped)) return mapped;
     }
@@ -416,14 +496,12 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     return fileName ? join(hostRoot, fileName) : hostRoot;
   }
 
-  /** 把容器路径 /downloads/... 映射到宿主机 QB_DOWNLOAD_PATH/... */
   private mapContainerPathToHost(containerPath: string, hostRoot: string) {
     const p = containerPath.replace(/\/+$/, '');
     if (p === '/downloads' || p.startsWith('/downloads/')) {
       const rel = p === '/downloads' ? '' : p.slice('/downloads/'.length);
       return rel ? join(hostRoot, rel) : hostRoot;
     }
-    // 已是宿主机绝对路径
     if (isAbsolute(p) && existsSync(p)) return p;
     return null;
   }
@@ -473,6 +551,7 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
 
   private guessContentType(name: string) {
     const lower = (name || '').toLowerCase();
+    if (lower.includes('.m3u8')) return 'application/vnd.apple.mpegurl';
     if (lower.endsWith('.mp4') || lower.endsWith('.m4v')) return 'video/mp4';
     if (lower.endsWith('.webm')) return 'video/webm';
     if (lower.endsWith('.mkv')) return 'video/x-matroska';
@@ -480,7 +559,10 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     return 'application/octet-stream';
   }
 
-  private toView(session: PlaybackSession) {
+  private toView(
+    session: PlaybackSession,
+    playMode: 'progressive' | 'stream' = 'progressive',
+  ) {
     const playable =
       session.status === 'playable' || session.status === 'ready';
     return {
@@ -495,9 +577,8 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       errorMessage: session.error_message || undefined,
       bangumiId: session.bangumi_id,
       episodeSort: session.episode_sort,
-      /** 前端播放地址（需带 JWT，走后端 Range 代理） */
       playUrl: playable ? `/api/playback/sessions/${session.id}/stream` : null,
-      playMode: 'progressive' as const,
+      playMode,
     };
   }
 

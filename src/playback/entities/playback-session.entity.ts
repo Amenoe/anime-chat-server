@@ -46,11 +46,14 @@ export class PlaybackSession {
   @Column({ type: 'varchar', length: 512, default: '' })
   file_name: string;
 
-  /** 宿主机上可读路径 */
+  /** BT 落盘路径（流媒体会话为空） */
   @Column({ type: 'varchar', length: 1024, default: '' })
   local_path: string;
 
-  /** MinIO 对象键（可选备份） */
+  /**
+   * 历史列，播放不再使用 MinIO；保留列避免改表。
+   * @deprecated
+   */
   @Column({ type: 'varchar', length: 512, default: '' })
   minio_object: string;
 

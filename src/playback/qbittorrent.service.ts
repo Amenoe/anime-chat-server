@@ -95,7 +95,11 @@ export class QbittorrentService {
   }
 
   /** 连通性自检：登录 + 读版本 */
-  async healthCheck(): Promise<{ ok: boolean; version?: string; message?: string }> {
+  async healthCheck(): Promise<{
+    ok: boolean;
+    version?: string;
+    message?: string;
+  }> {
     try {
       this.cookie = '';
       await this.ensureLogin();
@@ -229,22 +233,16 @@ export class QbittorrentService {
     body0.set('hash', hash);
     body0.set('id', allIdx);
     body0.set('priority', '0');
-    await this.request(
-      'post',
-      '/api/v2/torrents/filePrio',
-      body0.toString(),
-      { 'Content-Type': 'application/x-www-form-urlencoded' },
-    );
+    await this.request('post', '/api/v2/torrents/filePrio', body0.toString(), {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    });
     const body1 = new URLSearchParams();
     body1.set('hash', hash);
     body1.set('id', String(fileIndex));
     body1.set('priority', '1');
-    await this.request(
-      'post',
-      '/api/v2/torrents/filePrio',
-      body1.toString(),
-      { 'Content-Type': 'application/x-www-form-urlencoded' },
-    );
+    await this.request('post', '/api/v2/torrents/filePrio', body1.toString(), {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    });
   }
 
   pickBestVideoFile(files: QbTorrentFile[]): QbTorrentFile | null {
