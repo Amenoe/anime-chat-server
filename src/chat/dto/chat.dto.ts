@@ -25,3 +25,32 @@ export interface GroupMessageView {
   nickname: string;
   avatar?: string;
 }
+
+/** joinRoom 进房 */
+export interface JoinRoomDto {
+  season_id?: string;
+  create?: boolean;
+  anime_id?: number;
+  episode_id?: number;
+  episode_sort?: number;
+  group_name?: string;
+}
+
+/** playback:control 播放控制 */
+export interface PlaybackControlDto {
+  group_id: string;
+  action:
+    | 'play'
+    | 'pause'
+    | 'seek'
+    | 'switch_episode'
+    | 'set_source'
+    | 'heartbeat';
+  position?: number;
+  episode_sort?: number;
+  episode_id?: number;
+  session_id?: string;
+  stream_url?: string;
+  title?: string;
+  paused?: boolean;
+}

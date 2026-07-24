@@ -15,13 +15,22 @@ import { Anime } from 'src/anime/entities/anime.entity';
 import { Group } from 'src/group/entities/group.entity';
 import { GroupUserMap } from 'src/group/entities/group_user_map.entity';
 import { GroupMessage } from 'src/group/entities/group_message.entity';
-import { AddGroupDto, GroupMessageDto, GroupMessageView } from './dto/chat.dto';
+import { RoomService } from 'src/room/room.service';
+import {
+  AddGroupDto,
+  GroupMessageDto,
+  GroupMessageView,
+  JoinRoomDto,
+  PlaybackControlDto,
+} from './dto/chat.dto';
 
 const HISTORY_LIMIT = 50;
 
 type SocketMeta = {
   userId: string | null;
   groupId: string | null;
+  seasonId: string | null;
+  joinedAt: number;
 };
 
 @WebSocketGateway({ cors: true })
@@ -37,6 +46,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly groupUserRepository: Repository<GroupUserMap>,
     @InjectRepository(GroupMessage)
     private readonly groupMessageRepository: Repository<GroupMessage>,
+    private readonly roomService: RoomService,
   ) {}
 
   @WebSocketServer()
@@ -45,20 +55,29 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   /** socket.id → 用户 / 所在房间（兼容旧 @types/socket.io 无 socket.data） */
   private readonly socketMeta = new Map<string, SocketMeta>();
 
+  private readonly lastPlaybackWrite = new Map<string, number>();
+  private readonly PLAYBACK_WRITE_THROTTLE = 2000;
+
   async handleConnection(client: Socket): Promise<void> {
     const raw = (client.handshake as any)?.query?.user_id;
     const userId = raw != null && raw !== '' ? String(raw) : null;
-    this.socketMeta.set(client.id, { userId, groupId: null });
+    this.socketMeta.set(client.id, {
+      userId,
+      groupId: null,
+      seasonId: null,
+      joinedAt: Date.now(),
+    });
   }
 
   async handleDisconnect(client: Socket): Promise<void> {
     const meta = this.socketMeta.get(client.id);
     const groupId = meta?.groupId;
+    const userId = meta?.userId;
+    const seasonId = meta?.seasonId;
     this.socketMeta.delete(client.id);
     if (groupId) {
-      // 断连后房间集合已更新，下一 tick 再广播
       setImmediate(() => {
-        void this.broadcastActiveUser(groupId);
+        void this.handleLeaveGroup(groupId, userId, seasonId);
       });
     }
   }
@@ -108,6 +127,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const meta = this.socketMeta.get(client.id) || {
       userId: null,
       groupId: null,
+      seasonId: null,
+      joinedAt: Date.now(),
     };
     const prevGroupId = meta.groupId;
     if (prevGroupId && prevGroupId !== group.group_id) {
@@ -117,6 +138,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     client.join(group.group_id);
     meta.groupId = group.group_id;
+    meta.seasonId = group.season_id ?? null;
+    meta.joinedAt = Date.now();
     this.socketMeta.set(client.id, meta);
 
     // 只回给当前连接，避免别人被切房
@@ -221,9 +244,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const roomId = payload.group_id;
       if (meta?.groupId !== roomId) {
         client.join(roomId);
+        const existing = this.socketMeta.get(client.id);
         this.socketMeta.set(client.id, {
           userId: user.user_id,
           groupId: roomId,
+          seasonId: existing?.seasonId ?? null,
+          joinedAt: existing?.joinedAt ?? Date.now(),
         });
       }
 
@@ -341,5 +367,365 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const n = Number(body as unknown);
     if (Number.isFinite(n) && n > 0) return { anime_id: n };
     return null;
+  }
+
+  // ─── joinRoom ────────────────────────────────────────────────
+
+  @SubscribeMessage('joinRoom')
+  async joinRoom(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() body: JoinRoomDto,
+  ): Promise<void> {
+    try {
+      const meta = this.socketMeta.get(client.id) || {
+        userId: null,
+        groupId: null,
+        seasonId: null,
+        joinedAt: Date.now(),
+      };
+      const userId = meta.userId;
+      if (!userId) {
+        client.emit('joinRoom', { code: 401, message: '未登录', data: null });
+        return;
+      }
+
+      let group: Group | null = null;
+
+      if (body.season_id) {
+        group = await this.roomService.findBySeasonId(body.season_id);
+        if (!group) {
+          client.emit('joinRoom', {
+            code: 404,
+            message: '房间不存在',
+            data: null,
+          });
+          return;
+        }
+      } else if (body.create) {
+        if (!body.anime_id) {
+          client.emit('joinRoom', {
+            code: 400,
+            message: '创建房间需要 anime_id',
+            data: null,
+          });
+          return;
+        }
+        group = await this.roomService.createRoom(userId, {
+          anime_id: body.anime_id,
+          episode_id: body.episode_id,
+          episode_sort: body.episode_sort,
+          group_name: body.group_name,
+        });
+      } else {
+        client.emit('joinRoom', {
+          code: 400,
+          message: '需要 season_id 或 create=true',
+          data: null,
+        });
+        return;
+      }
+
+      const prevGroupId = meta.groupId;
+      if (prevGroupId && prevGroupId !== group.group_id) {
+        client.leave(prevGroupId);
+        setImmediate(() => {
+          void this.handleLeaveGroup(prevGroupId, userId, meta.seasonId);
+        });
+      }
+
+      client.join(group.group_id);
+      meta.groupId = group.group_id;
+      meta.seasonId = group.season_id;
+      meta.joinedAt = Date.now();
+      this.socketMeta.set(client.id, meta);
+
+      const role = group.host_user_id === userId ? 'host' : 'viewer';
+      const playbackState = this.roomService.toPlaybackState(group);
+      const recentMessages = await this.fetchRecentMessages(group.group_id);
+      const onlineUsers = this.getOnlineUserIds(group.group_id);
+
+      client.emit('joinRoom', {
+        code: 200,
+        message: '进房成功',
+        data: {
+          group,
+          role,
+          playback_state: playbackState,
+          recent_messages: recentMessages,
+          online_users: onlineUsers,
+        },
+      });
+
+      await this.broadcastActiveUser(group.group_id);
+    } catch (err: any) {
+      // eslint-disable-next-line no-console
+      console.error('[joinRoom] failed', err);
+      client.emit('joinRoom', {
+        code: 500,
+        message: String(err?.message || '进房失败').slice(0, 200),
+        data: null,
+      });
+    }
+  }
+
+  // ─── leaveRoom ───────────────────────────────────────────────
+
+  @SubscribeMessage('leaveRoom')
+  async leaveRoom(@ConnectedSocket() client: Socket): Promise<void> {
+    const meta = this.socketMeta.get(client.id);
+    const groupId = meta?.groupId;
+    if (!groupId) return;
+
+    const userId = meta?.userId;
+    const seasonId = meta?.seasonId;
+
+    client.leave(groupId);
+    meta.groupId = null;
+    meta.seasonId = null;
+    this.socketMeta.set(client.id, meta);
+
+    await this.handleLeaveGroup(groupId, userId, seasonId);
+  }
+
+  // ─── playback:control ───────────────────────────────────────
+
+  @SubscribeMessage('playback:control')
+  async playbackControl(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() body: PlaybackControlDto,
+  ): Promise<void> {
+    try {
+      const meta = this.socketMeta.get(client.id);
+      const userId = meta?.userId;
+      if (!userId) {
+        client.emit('playback:control', {
+          code: 401,
+          message: '未登录',
+        });
+        return;
+      }
+
+      if (!body?.group_id || !body?.action) {
+        client.emit('playback:control', {
+          code: 400,
+          message: '参数不完整',
+        });
+        return;
+      }
+
+      const group = await this.groupRepository.findOne({
+        where: { group_id: body.group_id },
+      });
+      if (!group) {
+        client.emit('playback:control', {
+          code: 404,
+          message: '房间不存在',
+        });
+        return;
+      }
+
+      if (group.host_user_id !== userId) {
+        client.emit('playback:control', {
+          code: 403,
+          message: '只有房主可以控制播放',
+        });
+        return;
+      }
+
+      const patch: Partial<
+        Pick<
+          Group,
+          | 'playback_status'
+          | 'playback_episode_id'
+          | 'playback_episode_sort'
+          | 'playback_session_id'
+          | 'playback_stream_url'
+          | 'playback_position'
+          | 'playback_title'
+        >
+      > = {};
+
+      switch (body.action) {
+        case 'play':
+          patch.playback_status = 'playing';
+          if (body.position != null) patch.playback_position = body.position;
+          break;
+        case 'pause':
+          patch.playback_status = 'paused';
+          if (body.position != null) patch.playback_position = body.position;
+          break;
+        case 'seek':
+          if (body.position != null) patch.playback_position = body.position;
+          break;
+        case 'switch_episode':
+          if (body.episode_id != null)
+            patch.playback_episode_id = body.episode_id;
+          if (body.episode_sort != null)
+            patch.playback_episode_sort = body.episode_sort;
+          patch.playback_position = 0;
+          patch.playback_status = 'idle';
+          break;
+        case 'set_source':
+          if (body.stream_url != null)
+            patch.playback_stream_url = body.stream_url;
+          if (body.title != null) patch.playback_title = body.title;
+          if (body.session_id != null)
+            patch.playback_session_id = body.session_id;
+          break;
+        case 'heartbeat':
+          if (body.position != null) patch.playback_position = body.position;
+          break;
+      }
+
+      const isHeartbeat = body.action === 'heartbeat';
+      let shouldWriteDb = true;
+
+      if (isHeartbeat) {
+        const now = Date.now();
+        const last = this.lastPlaybackWrite.get(body.group_id) || 0;
+        if (now - last < this.PLAYBACK_WRITE_THROTTLE) {
+          shouldWriteDb = false;
+        } else {
+          this.lastPlaybackWrite.set(body.group_id, now);
+        }
+      }
+
+      let updated = group;
+      if (shouldWriteDb) {
+        updated = await this.roomService.updatePlayback(
+          body.group_id,
+          userId,
+          patch,
+        );
+      } else {
+        Object.assign(updated, patch);
+      }
+
+      this.server.to(body.group_id).emit('playback:state', {
+        group_id: updated.group_id,
+        season_id: updated.season_id,
+        status: updated.playback_status,
+        episode_id: updated.playback_episode_id,
+        episode_sort: updated.playback_episode_sort,
+        session_id: updated.playback_session_id,
+        stream_url: updated.playback_stream_url,
+        position: updated.playback_position,
+        paused: updated.playback_status === 'paused',
+        title: updated.playback_title,
+        host_user_id: updated.host_user_id,
+        server_time: Date.now(),
+        updated_at: updated.playback_updated_at,
+      });
+    } catch (err: any) {
+      // eslint-disable-next-line no-console
+      console.error('[playback:control] failed', err);
+      client.emit('playback:control', {
+        code: 500,
+        message: String(err?.message || '播放控制失败').slice(0, 200),
+      });
+    }
+  }
+
+  // ─── helpers ─────────────────────────────────────────────────
+
+  private async handleLeaveGroup(
+    groupId: string,
+    userId: string | null | undefined,
+    seasonId: string | null | undefined,
+  ): Promise<void> {
+    try {
+      const roomSockets = this.getRoomSocketIds(groupId);
+
+      if (roomSockets.length === 0) {
+        await this.roomService.destroyRoom(groupId);
+        return;
+      }
+
+      if (userId) {
+        const group = await this.groupRepository.findOne({
+          where: { group_id: groupId },
+        });
+        if (group && group.host_user_id === userId) {
+          let earliest: SocketMeta | null = null;
+          for (const sid of roomSockets) {
+            const m = this.socketMeta.get(sid);
+            if (
+              m?.userId &&
+              m.userId !== userId &&
+              (!earliest || m.joinedAt < earliest.joinedAt)
+            ) {
+              earliest = m;
+            }
+          }
+          if (earliest?.userId) {
+            await this.roomService.transferHost(groupId, earliest.userId);
+            this.server.to(groupId).emit('host:changed', {
+              season_id: seasonId ?? group.season_id,
+              host_user_id: earliest.userId,
+            });
+          }
+        }
+      }
+
+      void this.broadcastActiveUser(groupId);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[handleLeaveGroup] failed', err);
+    }
+  }
+
+  private getRoomSocketIds(groupId: string): string[] {
+    const adapter: any = this.server?.sockets?.adapter;
+    const room: Set<string> | undefined =
+      adapter?.rooms?.get?.(groupId) || adapter?.rooms?.[groupId];
+    if (!room) return [];
+    return typeof room.forEach === 'function'
+      ? Array.from(room as Set<string>)
+      : [];
+  }
+
+  private getOnlineUserIds(groupId: string): string[] {
+    const socketIds = this.getRoomSocketIds(groupId);
+    const users = new Set<string>();
+    for (const sid of socketIds) {
+      const meta = this.socketMeta.get(sid);
+      if (meta?.userId) users.add(meta.userId);
+    }
+    return Array.from(users);
+  }
+
+  private async fetchRecentMessages(
+    groupId: string,
+  ): Promise<GroupMessageView[]> {
+    const messages = await this.groupMessageRepository.find({
+      where: { group_id: groupId },
+      order: { time: 'DESC' },
+      take: HISTORY_LIMIT,
+    });
+    if (!messages.length) return [];
+
+    const userIds = [...new Set(messages.map((m) => m.user_id))];
+    const users = userIds.length
+      ? await this.userRepository.find({
+          where: userIds.map((user_id) => ({ user_id })),
+        })
+      : [];
+    const userMap = new Map(users.map((u) => [u.user_id, u]));
+
+    return messages
+      .map((item) => {
+        const user = userMap.get(item.user_id);
+        return {
+          id: item.id,
+          group_id: item.group_id,
+          user_id: item.user_id,
+          message: item.message,
+          message_type: item.message_type,
+          time: Number(item.time),
+          nickname: user?.nickname || '未知用户',
+          avatar: user?.avatar,
+        };
+      })
+      .reverse();
   }
 }

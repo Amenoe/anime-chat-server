@@ -7,10 +7,12 @@ import { GroupUserMap } from 'src/group/entities/group_user_map.entity';
 import { GroupMessage } from 'src/group/entities/group_message.entity';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Anime } from 'src/anime/entities/anime.entity';
+import { RoomModule } from 'src/room/room.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([User, Anime, Group, GroupUserMap, GroupMessage]),
+    RoomModule,
   ],
   providers: [ChatGateway, ChatService],
 })
