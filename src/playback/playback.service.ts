@@ -128,11 +128,31 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  /** 流媒体直链会话：立即 ready，stream 走后端代理 */
+  /**
+   * 流媒体会话：
+   * - 若 streamUrl 已是 m3u8/mp4 → 直接代理
+   * - 若是剧集播放页（Animeko 搜源产出）→ 再 resolve 真实视频地址
+   */
   async createFromStream(userId: string, dto: StreamPlaybackDto) {
-    const url = (dto.streamUrl || '').trim();
+    let url = (dto.streamUrl || '').trim();
     if (!/^https?:\/\//i.test(url)) {
       throw new BadRequestException('streamUrl 须为 http(s) 地址');
+    }
+
+    let headers = { ...(dto.headers || {}) };
+
+    // 播放页 → 真实媒体（对齐 Animeko WebVideoMatcher 阶段）
+    if (!this.looksLikeMedia(url)) {
+      this.logger.log(`resolve play page: ${url.slice(0, 120)}`);
+      const resolved = await this.sourceSearch.resolvePlayUrl(url);
+      if (resolved?.url) {
+        url = resolved.url;
+        headers = { ...headers, ...(resolved.headers || {}) };
+        this.logger.log(`resolved media: ${url.slice(0, 120)}`);
+      } else {
+        // 仍用原 URL 代理：部分站播放页本身可重定向出流
+        this.logger.warn(`resolve play page failed, proxy as-is: ${url}`);
+      }
     }
 
     const session = this.sessionRepo.create({
@@ -153,8 +173,8 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     });
     await this.sessionRepo.save(session);
 
-    if (dto.headers && Object.keys(dto.headers).length) {
-      this.streamHeaders.set(session.id, dto.headers);
+    if (Object.keys(headers).length) {
+      this.streamHeaders.set(session.id, headers);
     }
     return this.toView(session, 'stream');
   }

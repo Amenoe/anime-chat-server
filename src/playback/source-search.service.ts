@@ -8,10 +8,14 @@ import {
 } from '../media-source/media-source.service';
 
 export type PlayCandidate = {
-  /** bt = 磁力/种子；stream = 直链 m3u8/mp4 */
+  /**
+   * bt = 磁力/种子；
+   * stream = 流媒体（可能是剧集播放页，也可能是 m3u8/mp4 直链）
+   * 对齐 Animeko：搜索阶段通常只给 playUrl（播放页），真正视频在播放时再解析。
+   */
   kind: 'bt' | 'stream';
   title: string;
-  /** magnet / torrent URL / 直链视频 URL */
+  /** magnet / torrent / 播放页 / 直链 */
   uri: string;
   sourceName: string;
   subscriptionName: string;
@@ -19,6 +23,10 @@ export type PlayCandidate = {
   /** 流媒体播放可选请求头（Referer 等） */
   headers?: Record<string, string>;
   episodeSort?: number;
+  /** 线路名（web 多线路） */
+  channel?: string;
+  /** 是否已是可直接播放的媒体 URL */
+  resolved?: boolean;
 };
 
 const UA =
@@ -131,8 +139,8 @@ export class SourceSearchService {
       all.find(
         (c) =>
           c.kind === 'stream' &&
-          /^https?:\/\//i.test(c.uri) &&
-          this.looksLikeMedia(c.uri),
+          c.resolved &&
+          /^https?:\/\//i.test(c.uri),
       ) ||
       all.find((c) => c.kind === 'stream' && /^https?:\/\//i.test(c.uri)) ||
       null;
@@ -327,7 +335,16 @@ export class SourceSearchService {
       .replace(/&#39;/g, "'");
   }
 
-  // ─────────────────── Web selector ───────────────────
+  // ─────────────────── Web selector（对齐 Animeko SelectorMediaSource） ───────────────────
+  //
+  // Animeko 流程：
+  // 1) searchSubjects → 搜条目页 HTML
+  // 2) selectSubjects → CSS 选出条目列表
+  // 3) searchEpisodes → 拉条目详情
+  // 4) selectEpisodes → 按线路(channel)解析剧集列表，产出 playUrl（播放页，不是 m3u8）
+  // 5) 真正的 m3u8/mp4 在播放器 WebView 里用 matchVideo 拦截网络时得到
+  //
+  // 我们在搜索阶段同样返回「播放页」候选；点播放时再 resolvePlayUrl。
 
   private async searchWebSelector(
     entry: ParsedMediaSourceEntry,
@@ -338,107 +355,217 @@ export class SourceSearchService {
     const template = String(sc.searchUrl || '');
     if (!template) return [];
 
-    let q = keyword;
-    if (sc.searchUseOnlyFirstWord) {
-      q = keyword.split(/\s+/)[0] || keyword;
-    }
-    if (sc.searchRemoveSpecial) {
-      q = q.replace(/[^\w一-鿿\s]/g, '');
+    const q = this.buildSearchKeyword(keyword, sc);
+    // Animeko 用 path segment 编码，效果接近 encodeURIComponent
+    const searchUrl = template.replace(
+      /\{keyword\}/g,
+      encodeURIComponent(q),
+    );
+
+    let html: string;
+    try {
+      html = await this.fetchText(searchUrl, {
+        sc,
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      });
+    } catch (e) {
+      this.logger.debug(
+        `web search ${entry.name}: ${e instanceof Error ? e.message : e}`,
+      );
+      return [];
     }
 
-    const searchUrl = template.replace(/\{keyword\}/g, encodeURIComponent(q));
-    const html = await this.fetchText(searchUrl, { sc });
-    const subjects = this.parseSubjects(html, sc, searchUrl);
-    if (!subjects.length) return [];
+    if (this.looksLikeCaptcha(html, searchUrl)) {
+      this.logger.debug(`web captcha blocked: ${entry.name}`);
+      return [];
+    }
 
+    const subjects = this.selectSubjects(html, sc, searchUrl);
+    if (!subjects.length) {
+      this.logger.debug(`web no subjects: ${entry.name} q=${q}`);
+      return [];
+    }
+
+    // 按名称匹配度选最佳条目（Animeko 有 filter；我们简化为打分）
     subjects.sort(
       (a, b) =>
         this.titleKeywordScore(b.name, keyword) -
         this.titleKeywordScore(a.name, keyword),
     );
-    const best = subjects[0];
+    // 只尝试前 2 个条目，避免超时
+    const trySubjects = subjects.slice(0, 2);
 
-    const detailHtml = await this.fetchText(best.url, { sc });
-    const episode = this.parseEpisodeLink(
-      detailHtml,
-      sc,
-      best.url,
-      episodeSort,
-    );
-    if (!episode) return [];
+    const out: PlayCandidate[] = [];
 
-    const epHtml = await this.fetchText(episode.url, { sc });
-    const resolved = await this.resolveVideoFromHtml(epHtml, sc, episode.url);
+    for (const subject of trySubjects) {
+      let detailHtml: string;
+      try {
+        detailHtml = await this.fetchText(subject.url, { sc });
+      } catch {
+        continue;
+      }
+      if (this.looksLikeCaptcha(detailHtml, subject.url)) continue;
 
+      const episodes = this.selectEpisodes(
+        detailHtml,
+        sc,
+        subject.url,
+        episodeSort,
+      );
+      if (!episodes.length) continue;
+
+      for (const ep of episodes) {
+        const channelPart = ep.channel ? `${ep.channel} · ` : '';
+        out.push({
+          kind: 'stream',
+          title: `${subject.name} · ${channelPart}${ep.name}`,
+          uri: ep.url,
+          sourceName: entry.name,
+          subscriptionName: entry.subscriptionName,
+          score:
+            50 +
+            this.titleKeywordScore(subject.name, keyword) +
+            (ep.exact ? 30 : 0),
+          headers: this.buildVideoHeaders(sc, ep.url),
+          episodeSort,
+          channel: ep.channel,
+          resolved: false,
+        });
+      }
+      // 有结果就不再试下一个条目
+      if (out.length) break;
+    }
+
+    // 搜索阶段不 resolve 直链，尽快把播放页/线路返回给前端点选；
+    // 真实 m3u8/mp4 在 createFromStream → resolvePlayUrl 时再解析。
+    return out;
+  }
+
+  /**
+   * 播放时：把剧集播放页解析为 m3u8/mp4（对齐 Animeko WebVideoMatcher）
+   */
+  async resolvePlayUrl(
+    pageOrMediaUrl: string,
+    searchConfig?: Record<string, any>,
+  ): Promise<{ url: string; headers?: Record<string, string> } | null> {
+    const url = (pageOrMediaUrl || '').trim();
+    if (!url) return null;
+    if (this.looksLikeMedia(url)) {
+      return { url, headers: this.buildVideoHeaders(searchConfig || {}, url) };
+    }
+
+    const sc = searchConfig || {};
+    let html: string;
+    try {
+      html = await this.fetchText(url, { sc, timeout: 12000 });
+    } catch {
+      return null;
+    }
+    if (this.looksLikeCaptcha(html, url)) return null;
+
+    const video = await this.resolveVideoFromHtml(html, sc, url);
+    if (!video?.url) return null;
+    return {
+      url: video.url,
+      headers: this.buildVideoHeaders(sc, url),
+    };
+  }
+
+  private buildSearchKeyword(keyword: string, sc: Record<string, any>) {
+    let q = (keyword || '').trim();
+    // Animeko: searchRemoveSpecial 删剧场版等标记，保留空格供 firstWord
+    if (sc.searchRemoveSpecial !== false) {
+      q = q
+        .replace(/剧场版|特别篇|OVA|OAD|SP/gi, ' ')
+        .replace(/[^\w一-鿿\s.-]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+    if (sc.searchUseOnlyFirstWord !== false) {
+      const first = q.split(/\s+/)[0];
+      if (first) q = first;
+    }
+    return q || keyword.trim();
+  }
+
+  private buildVideoHeaders(sc: Record<string, any>, pageUrl: string) {
     const headers: Record<string, string> = {};
     const add = sc.matchVideo?.addHeadersToVideo || {};
     if (add.referer) headers.Referer = add.referer;
     else {
       try {
-        headers.Referer = new URL(episode.url).origin + '/';
+        headers.Referer = new URL(pageUrl).origin + '/';
       } catch {
         /* ignore */
       }
     }
-    if (add.userAgent) headers['User-Agent'] = add.userAgent;
+    headers['User-Agent'] =
+      add.userAgent ||
+      sc.matchVideo?.addHeadersToVideo?.userAgent ||
+      UA;
     if (sc.matchVideo?.cookies) headers.Cookie = sc.matchVideo.cookies;
-
-    if (!resolved?.url) {
-      // 详情页本身不像可播直链时降低分，避免误当 stream
-      return [];
-    }
-
-    return [
-      {
-        kind: 'stream',
-        title: `${best.name} · ${episode.name}`,
-        uri: resolved.url,
-        sourceName: entry.name,
-        subscriptionName: entry.subscriptionName,
-        score: 90 + this.titleKeywordScore(best.name, keyword),
-        headers,
-        episodeSort,
-      },
-    ];
+    return headers;
   }
 
-  private parseSubjects(
+  private looksLikeCaptcha(html: string, url: string) {
+    const h = (html || '').slice(0, 8000).toLowerCase();
+    const u = (url || '').toLowerCase();
+    if (u.includes('cloudflare') || h.includes('cf-challenge')) return true;
+    if (h.includes('captcha') && h.includes('verify')) return true;
+    if (h.includes('just a moment') || h.includes('checking your browser'))
+      return true;
+    return false;
+  }
+
+  /** Animeko selectSubjects */
+  private selectSubjects(
     html: string,
     sc: Record<string, any>,
     pageUrl: string,
   ): { name: string; url: string }[] {
     const $ = cheerio.load(html);
-    const formatId = sc.subjectFormatId || 'a';
+    const formatId = String(sc.subjectFormatId || 'a');
     const out: { name: string; url: string }[] = [];
+    const base = this.guessBaseUrl(sc, pageUrl);
 
-    if (formatId === 'indexed' || sc.selectorSubjectFormatIndexed) {
+    if (formatId === 'indexed') {
       const cfg = sc.selectorSubjectFormatIndexed || {};
       const names = $(cfg.selectNames || '').toArray();
       const links = $(cfg.selectLinks || '').toArray();
       const n = Math.max(names.length, links.length);
       for (let i = 0; i < n; i++) {
-        const nameEl = names[i] || links[i];
+        const nameEl = names[i];
         const linkEl = links[i] || names[i];
-        const name = $(nameEl).text().trim() || $(linkEl).attr('title') || '';
-        const href = $(linkEl).attr('href') || $(nameEl).attr('href') || '';
-        if (!href) continue;
-        out.push({ name, url: this.absUrl(pageUrl, href) });
+        const name =
+          (nameEl ? $(nameEl).text().trim() : '') ||
+          $(linkEl).attr('title') ||
+          $(linkEl).text().trim() ||
+          '';
+        const href = $(linkEl).attr('href') || '';
+        if (!href || !name) continue;
+        out.push({ name, url: this.absUrl(base || pageUrl, href) });
       }
-    }
-
-    if (!out.length) {
+    } else {
+      // subjectFormatId === 'a' 或默认
       const cfg = sc.selectorSubjectFormatA || {};
       const sel = cfg.selectLists || 'a';
       $(sel).each((_, el) => {
         const name =
+          $(el).attr('title')?.trim() ||
           $(el).text().trim() ||
-          $(el).attr('title') ||
           $(el).find('img').attr('alt') ||
           '';
         const href = $(el).attr('href') || '';
         if (!href || !name) return;
-        out.push({ name, url: this.absUrl(pageUrl, href) });
+        out.push({ name, url: this.absUrl(base || pageUrl, href) });
       });
+    }
+
+    const preferShorter =
+      sc.selectorSubjectFormatA?.preferShorterName ||
+      sc.selectorSubjectFormatIndexed?.preferShorterName;
+    if (preferShorter) {
+      out.sort((a, b) => a.name.length - b.name.length);
     }
 
     const seen = new Set<string>();
@@ -448,93 +575,210 @@ export class SourceSearchService {
         seen.add(s.url);
         return true;
       })
-      .slice(0, 12);
+      .slice(0, 20);
   }
 
-  private parseEpisodeLink(
+  /**
+   * Animeko selectEpisodes（index-grouped + no-channel）
+   * 返回匹配集数的播放页列表（可多线路）
+   */
+  private selectEpisodes(
     html: string,
     sc: Record<string, any>,
-    pageUrl: string,
+    subjectUrl: string,
     episodeSort: number,
-  ): { name: string; url: string } | null {
+  ): { name: string; url: string; channel?: string; exact: boolean }[] {
     const $ = cheerio.load(html);
+    const channelFormatId = String(sc.channelFormatId || 'index-grouped');
     const flat = sc.selectorChannelFormatFlattened || {};
     const noCh = sc.selectorChannelFormatNoChannel || {};
-    const candidates: { name: string; url: string; sort: number }[] = [];
+    const base = this.subjectBaseUrl(subjectUrl);
 
-    const epNameRe = new RegExp(
+    const epReSrc =
       flat.matchEpisodeSortFromName ||
-        noCh.matchEpisodeSortFromName ||
-        '第\\s*(?<ep>.+)\\s*[话集]|\\b(?<ep>\\d{1,3})\\b',
-      'i',
-    );
+      noCh.matchEpisodeSortFromName ||
+      '第\\s*(?<ep>.+)\\s*[话集]';
+    let epRe: RegExp;
+    try {
+      epRe = new RegExp(epReSrc, 'i');
+    } catch {
+      epRe = /第\s*(?<ep>.+)\s*[话集]/i;
+    }
 
-    const collect = (name: string, href: string) => {
-      if (!href) return;
-      const m = name.match(epNameRe) || href.match(epNameRe);
-      let sort = NaN;
+    type Ep = {
+      name: string;
+      url: string;
+      channel?: string;
+      sort: number;
+    };
+    const all: Ep[] = [];
+
+    const parseSort = (name: string): number => {
+      const m = name.match(epRe);
       if (m) {
         const raw = (m.groups?.ep || m[1] || '').toString();
-        sort = parseFloat(raw.replace(/[^\d.]/g, '')) || NaN;
+        const n = parseFloat(raw.replace(/[^\d.]/g, ''));
+        if (Number.isFinite(n)) return n;
       }
-      candidates.push({
-        name: name || `第${episodeSort}话`,
-        url: this.absUrl(pageUrl, href),
-        sort: Number.isFinite(sort) ? sort : -1,
-      });
+      // 纯数字 / EP01
+      const m2 = name.match(/(?:EP?|第)?\s*(\d{1,3}(?:\.\d)?)/i);
+      if (m2) return parseFloat(m2[1]);
+      // 正片/高清版 → 电影当 1（Animeko convertSpecialEpisodes）
+      if (/^(正片|高清版)$/.test(name.trim())) return 1;
+      return NaN;
     };
 
-    const listSel = flat.selectEpisodeLists;
-    const epSel = flat.selectEpisodesFromList || 'a';
-    if (listSel) {
-      $(listSel).each((_, list) => {
+    if (channelFormatId === 'index-grouped' || flat.selectEpisodeLists) {
+      const chSel = flat.selectChannelNames || '';
+      const listSel = flat.selectEpisodeLists || '';
+      const epSel = flat.selectEpisodesFromList || 'a';
+      const matchCh = flat.matchChannelName
+        ? (() => {
+            try {
+              return new RegExp(flat.matchChannelName, 'i');
+            } catch {
+              return null;
+            }
+          })()
+        : null;
+
+      const channelNodes = chSel ? $(chSel).toArray() : [];
+      const channelNames = channelNodes.map((el) => {
+        const text = $(el).text().trim();
+        if (!text) return null;
+        if (!matchCh) return text;
+        const m = text.match(matchCh);
+        if (!m) return null;
+        return (m.groups?.ch || m[1] || text).toString().trim() || text;
+      });
+
+      const lists = listSel ? $(listSel).toArray() : [];
+      for (let i = 0; i < lists.length; i++) {
+        const channel =
+          channelNames[i] != null
+            ? channelNames[i]!
+            : channelNames.find((c) => c) || undefined;
+        // matchChannelName 过滤掉的线路（如 (?!高清线路3) 在 JS 里需特殊处理）
+        if (matchCh && channelNodes[i] && channelNames[i] === null) {
+          // 负向：若配置是 (?!xxx) 类，cheerio 文本 match 可能恒 null；放宽：仍解析
+        }
+        const list = lists[i];
+        const linksSel = flat.selectEpisodeLinksFromList;
+        const linkHrefs = linksSel
+          ? $(list)
+              .find(linksSel)
+              .toArray()
+              .map((a) => $(a).attr('href') || '')
+          : null;
+
         $(list)
           .find(epSel)
-          .each((__, a) => {
+          .each((idx, a) => {
             const name = $(a).text().trim() || $(a).attr('title') || '';
-            const href = $(a).attr('href') || '';
-            collect(name, href);
+            if (!name) return;
+            // 跳过像线路名的项
+            if (channelNames.includes(name)) return;
+            const href =
+              (linkHrefs && linkHrefs[idx]) || $(a).attr('href') || '';
+            if (!href) return;
+            all.push({
+              name,
+              url: this.absUrl(base, href),
+              channel: channel || undefined,
+              sort: parseSort(name),
+            });
           });
-      });
-    }
-
-    if (!candidates.length && noCh.selectEpisodes) {
-      const nameNodes = $(noCh.selectEpisodes).toArray();
-      const linkNodes = noCh.selectEpisodeLinks
-        ? $(noCh.selectEpisodeLinks).toArray()
-        : nameNodes;
-      for (let i = 0; i < Math.max(nameNodes.length, linkNodes.length); i++) {
-        const n = nameNodes[i] || linkNodes[i];
-        const l = linkNodes[i] || nameNodes[i];
-        collect(
-          $(n).text().trim() || $(n).attr('title') || '',
-          $(l).attr('href') || '',
-        );
       }
     }
 
-    if (!candidates.length) {
+    if (!all.length) {
+      const epSel = noCh.selectEpisodes || '';
+      const linkSel = noCh.selectEpisodeLinks || '';
+      if (epSel) {
+        const nameNodes = $(epSel).toArray();
+        const linkNodes = linkSel ? $(linkSel).toArray() : nameNodes;
+        for (let i = 0; i < Math.max(nameNodes.length, linkNodes.length); i++) {
+          const n = nameNodes[i] || linkNodes[i];
+          const l = linkNodes[i] || nameNodes[i];
+          const name = $(n).text().trim() || $(n).attr('title') || '';
+          const href = $(l).attr('href') || '';
+          if (!name || !href) continue;
+          all.push({
+            name,
+            url: this.absUrl(base, href),
+            sort: parseSort(name),
+          });
+        }
+      }
+    }
+
+    if (!all.length) {
       $('a').each((_, a) => {
         const name = $(a).text().trim();
-        if (!/第\s*\d+|EP?\s*\d+|\b\d{1,3}\s*话/i.test(name)) return;
-        collect(name, $(a).attr('href') || '');
+        if (!/第\s*\d+|EP?\s*\d+|\b\d{1,3}\s*[话集]/i.test(name)) return;
+        const href = $(a).attr('href') || '';
+        if (!href) return;
+        all.push({
+          name,
+          url: this.absUrl(base, href),
+          sort: parseSort(name),
+        });
       });
     }
 
-    if (!candidates.length) return null;
-
-    const exact = candidates.find(
-      (c) => c.sort === episodeSort || c.sort === Math.floor(episodeSort),
+    const target = Math.floor(episodeSort);
+    const exact = all.filter(
+      (e) => Number.isFinite(e.sort) && Math.floor(e.sort) === target,
     );
-    if (exact) return exact;
+    const pool = exact.length ? exact : all;
+    // 每线路保留一条最匹配
+    const byChannel = new Map<string, Ep>();
+    for (const e of pool) {
+      const key = e.channel || e.url;
+      const prev = byChannel.get(key);
+      if (!prev) {
+        byChannel.set(key, e);
+        continue;
+      }
+      // 精确集数优先
+      const prevExact =
+        Number.isFinite(prev.sort) && Math.floor(prev.sort) === target;
+      const curExact =
+        Number.isFinite(e.sort) && Math.floor(e.sort) === target;
+      if (curExact && !prevExact) byChannel.set(key, e);
+    }
 
-    const byName = candidates.find((c) =>
-      this.matchesEpisode(c.name, episodeSort),
-    );
-    if (byName) return byName;
+    return [...byChannel.values()].map((e) => ({
+      name: e.name,
+      url: e.url,
+      channel: e.channel,
+      exact: Number.isFinite(e.sort) && Math.floor(e.sort) === target,
+    }));
+  }
 
-    const idx = Math.max(0, Math.floor(episodeSort) - 1);
-    return candidates[idx] || candidates[0];
+  private guessBaseUrl(sc: Record<string, any>, pageUrl: string) {
+    if (sc.rawBaseUrl) return String(sc.rawBaseUrl);
+    try {
+      const u = new URL(pageUrl);
+      return `${u.protocol}//${u.host}`;
+    } catch {
+      return pageUrl;
+    }
+  }
+
+  private subjectBaseUrl(subjectUrl: string) {
+    try {
+      const u = new URL(subjectUrl);
+      // Animeko: drop last path segment
+      const parts = u.pathname.split('/').filter(Boolean);
+      if (parts.length) parts.pop();
+      u.pathname = '/' + parts.join('/');
+      u.search = '';
+      u.hash = '';
+      return u.toString().replace(/\/?$/, '/');
+    } catch {
+      return subjectUrl;
+    }
   }
 
   private async resolveVideoFromHtml(
@@ -548,9 +792,15 @@ export class SourceSearchService {
       : /(https?:\/\/[^\s"'<>]+?\.(?:mp4|m3u8|mkv|flv)(?:\?[^\s"'<>]*)?)/i;
 
     const tryMatch = (text: string): string | null => {
-      const m = text.match(videoRe);
+      const decoded = text
+        .replace(/\\u002F/g, '/')
+        .replace(/\\\//g, '/')
+        .replace(/&amp;/g, '&');
+      const m = decoded.match(videoRe);
       if (!m) return null;
-      const url = (m.groups?.v || m[1] || m[0] || '').replace(/\\u002F/g, '/');
+      let url = (m.groups?.v || m[1] || m[0] || '').trim();
+      // 去掉结尾脏字符
+      url = url.replace(/["'<>\\\s].*$/, '');
       if (!/^https?:\/\//i.test(url)) return null;
       return url;
     };
@@ -558,43 +808,54 @@ export class SourceSearchService {
     let found = tryMatch(html);
     if (found) return { url: found };
 
+    // MacCMS / 常见播放器配置
     const playerPatterns = [
-      /"url"\s*:\s*"(https?:[^"]+)"/gi,
-      /"url"\s*:\s*"(https?:[^"]+\.m3u8[^"]*)"/gi,
       /player_aaaa\s*=\s*(\{[\s\S]*?\})\s*;/i,
+      /"url"\s*:\s*"((?:https?:)?\\?\/\\?\/[^"]+)"/gi,
+      /"url"\s*:\s*"(https?:[^"]+)"/gi,
       /<video[^>]+src=["']([^"']+)["']/i,
       /source\s+src=["']([^"']+)["']/i,
+      /src\s*[:=]\s*["'](https?:[^"']+\.m3u8[^"']*)["']/i,
     ];
     for (const re of playerPatterns) {
-      const m = html.match(re);
+      re.lastIndex = 0;
+      const m = re.exec(html);
       if (!m) continue;
       if (m[1]?.startsWith('{')) {
         try {
           const obj = JSON.parse(m[1]);
-          const u = obj.url || obj.url_next;
-          if (u && /^https?:/i.test(u)) return { url: u };
+          let u = obj.url || obj.url_next;
+          if (typeof u === 'string') {
+            u = u.replace(/\\u002F/g, '/').replace(/\\\//g, '/');
+            if (u.startsWith('//')) u = 'https:' + u;
+            if (/^https?:/i.test(u)) return { url: u };
+            // 可能是相对加密路径，继续 tryMatch 整段
+            found = tryMatch(m[1]);
+            if (found) return { url: found };
+          }
         } catch {
           /* ignore */
         }
-      } else if (m[1] && /^https?:/i.test(m[1])) {
-        return { url: m[1] };
-      } else {
-        found = tryMatch(m[0]);
+      } else if (m[1]) {
+        let u = m[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/');
+        if (u.startsWith('//')) u = 'https:' + u;
+        if (/^https?:/i.test(u)) return { url: u };
+        found = tryMatch(u);
         if (found) return { url: found };
       }
     }
 
-    // 嵌套只探 3 个，避免拖垮时限
+    // 嵌套 iframe / nested url（Animeko shouldLoadPage）
     if (mv.enableNestedUrl && mv.matchNestedUrl && mv.matchNestedUrl !== '$^') {
       try {
         const nestedRe = new RegExp(mv.matchNestedUrl, 'i');
         const hrefs = [...html.matchAll(/https?:\/\/[^\s"'<>]+/g)].map(
           (x) => x[0],
         );
-        for (const h of hrefs.slice(0, 3)) {
+        for (const h of hrefs.slice(0, 5)) {
           if (!nestedRe.test(h)) continue;
           try {
-            const nestedHtml = await this.fetchText(h, { sc, timeout: 6000 });
+            const nestedHtml = await this.fetchText(h, { sc, timeout: 8000 });
             const v = tryMatch(nestedHtml);
             if (v) return { url: v };
           } catch {
@@ -607,13 +868,16 @@ export class SourceSearchService {
     }
 
     const $ = cheerio.load(html);
-    const iframe = $('iframe').attr('src');
-    if (iframe) {
+    const iframes = $('iframe')
+      .toArray()
+      .map((el) => $(el).attr('src'))
+      .filter(Boolean) as string[];
+    for (const iframe of iframes.slice(0, 3)) {
       try {
         const iframeUrl = this.absUrl(pageUrl, iframe);
         const iframeHtml = await this.fetchText(iframeUrl, {
           sc,
-          timeout: 6000,
+          timeout: 8000,
         });
         const v = tryMatch(iframeHtml);
         if (v) return { url: v };
