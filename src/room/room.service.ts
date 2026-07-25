@@ -52,11 +52,14 @@ export class RoomService {
   }
 
   async listByAnime(animeId: number, episodeSort?: number): Promise<Group[]> {
-    const where: Record<string, any> = { anime_id: animeId };
+    const qb = this.groupRepository
+      .createQueryBuilder('g')
+      .where('g.anime_id = :animeId', { animeId })
+      .andWhere("g.season_id IS NOT NULL AND g.season_id != ''");
     if (episodeSort != null) {
-      where.episode_sort = episodeSort;
+      qb.andWhere('g.episode_sort = :episodeSort', { episodeSort });
     }
-    return this.groupRepository.find({ where });
+    return qb.getMany();
   }
 
   async findBySeasonId(seasonId: string): Promise<Group | null> {
