@@ -142,16 +142,28 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     let headers = { ...(dto.headers || {}) };
 
     // 播放页 → 真实媒体（对齐 Animeko WebVideoMatcher 阶段）
+    // 必须传入前端 headers（Referer/Cookie），否则部分站解析失败
     if (!this.looksLikeMedia(url)) {
       this.logger.log(`resolve play page: ${url.slice(0, 120)}`);
-      const resolved = await this.sourceSearch.resolvePlayUrl(url);
-      if (resolved?.url) {
+      const resolved = await this.sourceSearch.resolvePlayUrl(
+        url,
+        undefined,
+        headers,
+      );
+      if (resolved?.url && this.looksLikeMedia(resolved.url)) {
         url = resolved.url;
         headers = { ...headers, ...(resolved.headers || {}) };
-        this.logger.log(`resolved media: ${url.slice(0, 120)}`);
+        this.logger.log(`resolved media: ${url.slice(0, 160)}`);
+      } else if (resolved?.url) {
+        // 解析出 URL 但扩展名不标准，仍尝试当媒体用
+        url = resolved.url;
+        headers = { ...headers, ...(resolved.headers || {}) };
+        this.logger.log(`resolved nonstandard media: ${url.slice(0, 160)}`);
       } else {
-        // 仍用原 URL 代理：部分站播放页本身可重定向出流
-        this.logger.warn(`resolve play page failed, proxy as-is: ${url}`);
+        // 禁止把 HTML 播放页当视频流代理（会「创建成功但播不了」）
+        throw new BadRequestException(
+          '无法从播放页解析出视频地址，请换线路或数据源',
+        );
       }
     }
 

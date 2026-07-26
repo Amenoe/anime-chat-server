@@ -447,27 +447,80 @@ export class SourceSearchService {
   async resolvePlayUrl(
     pageOrMediaUrl: string,
     searchConfig?: Record<string, any>,
+    extraHeaders?: Record<string, string>,
   ): Promise<{ url: string; headers?: Record<string, string> } | null> {
     const url = (pageOrMediaUrl || '').trim();
     if (!url) return null;
     if (this.looksLikeMedia(url)) {
-      return { url, headers: this.buildVideoHeaders(searchConfig || {}, url) };
+      return {
+        url,
+        headers: {
+          ...this.buildVideoHeaders(searchConfig || {}, url),
+          ...(extraHeaders || {}),
+        },
+      };
     }
 
     const sc = searchConfig || {};
+    // 前端选源时带来的 Referer/Cookie/UA 合并进 sc.matchVideo
+    if (extraHeaders && Object.keys(extraHeaders).length) {
+      const cookies =
+        extraHeaders.Cookie ||
+        extraHeaders.cookie ||
+        sc.matchVideo?.cookies ||
+        '';
+      sc.matchVideo = {
+        ...(sc.matchVideo || {}),
+        cookies: cookies || sc.matchVideo?.cookies || '',
+        addHeadersToVideo: {
+          ...(sc.matchVideo?.addHeadersToVideo || {}),
+          referer:
+            extraHeaders.Referer ||
+            extraHeaders.referer ||
+            sc.matchVideo?.addHeadersToVideo?.referer ||
+            '',
+          userAgent:
+            extraHeaders['User-Agent'] ||
+            extraHeaders['user-agent'] ||
+            sc.matchVideo?.addHeadersToVideo?.userAgent ||
+            '',
+        },
+      };
+    }
+
     let html: string;
     try {
-      html = await this.fetchText(url, { sc, timeout: 12000 });
-    } catch {
+      html = await this.fetchText(url, {
+        sc,
+        timeout: 15000,
+        extraHeaders,
+      });
+    } catch (e) {
+      this.logger.warn(
+        `resolvePlayUrl fetch failed: ${e instanceof Error ? e.message : e}`,
+      );
       return null;
     }
-    if (this.looksLikeCaptcha(html, url)) return null;
+    if (this.looksLikeCaptcha(html, url)) {
+      this.logger.warn(`resolvePlayUrl captcha: ${url.slice(0, 120)}`);
+      return null;
+    }
 
     const video = await this.resolveVideoFromHtml(html, sc, url);
-    if (!video?.url) return null;
+    if (!video?.url) {
+      this.logger.warn(
+        `resolvePlayUrl no media in page: ${url.slice(0, 120)} htmlLen=${
+          html?.length || 0
+        }`,
+      );
+      return null;
+    }
     return {
       url: video.url,
-      headers: this.buildVideoHeaders(sc, url),
+      headers: {
+        ...this.buildVideoHeaders(sc, url),
+        ...(extraHeaders || {}),
+      },
     };
   }
 
@@ -781,36 +834,122 @@ export class SourceSearchService {
     }
   }
 
+  /** 从 HTML 中提取 MacCMS player_aaaa 等平衡花括号 JSON */
+  private extractBalancedJsonObject(
+    html: string,
+    marker: RegExp,
+  ): string | null {
+    const m = html.match(marker);
+    if (!m || m.index == null) return null;
+    const start = html.indexOf('{', m.index);
+    if (start < 0) return null;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < html.length; i++) {
+      const ch = html[i];
+      if (inStr) {
+        if (esc) {
+          esc = false;
+          continue;
+        }
+        if (ch === '\\') {
+          esc = true;
+          continue;
+        }
+        if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') {
+        inStr = true;
+        continue;
+      }
+      if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) return html.slice(start, i + 1);
+      }
+    }
+    return null;
+  }
+
+  private normalizeMediaUrl(raw: string): string | null {
+    if (!raw) return null;
+    let u = raw
+      .replace(/\\u002F/gi, '/')
+      .replace(/\\\//g, '/')
+      .replace(/&amp;/g, '&')
+      .trim();
+    u = u.replace(/["'<>\\\s].*$/, '');
+    if (u.startsWith('//')) u = 'https:' + u;
+    if (!/^https?:\/\//i.test(u)) return null;
+    return u;
+  }
+
   private async resolveVideoFromHtml(
     html: string,
     sc: Record<string, any>,
     pageUrl: string,
   ): Promise<{ url: string } | null> {
     const mv = sc.matchVideo || {};
-    const videoRe = mv.matchVideoUrl
-      ? new RegExp(mv.matchVideoUrl, 'i')
-      : /(https?:\/\/[^\s"'<>]+?\.(?:mp4|m3u8|mkv|flv)(?:\?[^\s"'<>]*)?)/i;
+    let videoRe: RegExp;
+    try {
+      videoRe = mv.matchVideoUrl
+        ? new RegExp(mv.matchVideoUrl, 'i')
+        : /(https?:\/\/[^\s"'<>]+?\.(?:mp4|m3u8|mkv|flv)(?:\?[^\s"'<>]*)?)/i;
+    } catch {
+      videoRe =
+        /(https?:\/\/[^\s"'<>]+?\.(?:mp4|m3u8|mkv|flv)(?:\?[^\s"'<>]*)?)/i;
+    }
 
     const tryMatch = (text: string): string | null => {
       const decoded = text
-        .replace(/\\u002F/g, '/')
+        .replace(/\\u002F/gi, '/')
         .replace(/\\\//g, '/')
         .replace(/&amp;/g, '&');
       const m = decoded.match(videoRe);
-      if (!m) return null;
-      let url = (m.groups?.v || m[1] || m[0] || '').trim();
-      // 去掉结尾脏字符
-      url = url.replace(/["'<>\\\s].*$/, '');
-      if (!/^https?:\/\//i.test(url)) return null;
-      return url;
+      if (!m) {
+        // 站点 matchVideoUrl 过严时回退通用 m3u8/mp4
+        const fallback = decoded.match(
+          /(https?:\/\/[^\s"'<>\\]+?\.(?:mp4|m3u8)(?:\?[^\s"'<>\\]*)?)/i,
+        );
+        if (!fallback) return null;
+        return this.normalizeMediaUrl(fallback[1] || fallback[0]);
+      }
+      return this.normalizeMediaUrl(m.groups?.v || m[1] || m[0] || '');
     };
+
+    // 1) MacCMS player_aaaa 优先（平衡括号 JSON，避免嵌套截断）
+    const aaaaJson = this.extractBalancedJsonObject(
+      html,
+      /player_aaaa\s*=/i,
+    );
+    if (aaaaJson) {
+      try {
+        const obj = JSON.parse(aaaaJson);
+        const candidates = [obj.url, obj.url_next, obj.link].filter(
+          (x) => typeof x === 'string',
+        ) as string[];
+        for (const c of candidates) {
+          const u = this.normalizeMediaUrl(c);
+          if (u && this.looksLikeMedia(u)) return { url: u };
+          // 相对路径或未带扩展名：仍可当候选
+          if (u) return { url: u };
+        }
+        const foundInJson = tryMatch(aaaaJson);
+        if (foundInJson) return { url: foundInJson };
+      } catch (e) {
+        this.logger.debug(
+          `player_aaaa parse fail: ${e instanceof Error ? e.message : e}`,
+        );
+      }
+    }
 
     let found = tryMatch(html);
     if (found) return { url: found };
 
-    // MacCMS / 常见播放器配置
+    // 2) 其它常见字段
     const playerPatterns = [
-      /player_aaaa\s*=\s*(\{[\s\S]*?\})\s*;/i,
       /"url"\s*:\s*"((?:https?:)?\\?\/\\?\/[^"]+)"/gi,
       /"url"\s*:\s*"(https?:[^"]+)"/gi,
       /<video[^>]+src=["']([^"']+)["']/i,
@@ -821,26 +960,10 @@ export class SourceSearchService {
       re.lastIndex = 0;
       const m = re.exec(html);
       if (!m) continue;
-      if (m[1]?.startsWith('{')) {
-        try {
-          const obj = JSON.parse(m[1]);
-          let u = obj.url || obj.url_next;
-          if (typeof u === 'string') {
-            u = u.replace(/\\u002F/g, '/').replace(/\\\//g, '/');
-            if (u.startsWith('//')) u = 'https:' + u;
-            if (/^https?:/i.test(u)) return { url: u };
-            // 可能是相对加密路径，继续 tryMatch 整段
-            found = tryMatch(m[1]);
-            if (found) return { url: found };
-          }
-        } catch {
-          /* ignore */
-        }
-      } else if (m[1]) {
-        let u = m[1].replace(/\\u002F/g, '/').replace(/\\\//g, '/');
-        if (u.startsWith('//')) u = 'https:' + u;
-        if (/^https?:/i.test(u)) return { url: u };
-        found = tryMatch(u);
+      if (m[1]) {
+        const u = this.normalizeMediaUrl(m[1]);
+        if (u) return { url: u };
+        found = tryMatch(m[1]);
         if (found) return { url: found };
       }
     }
@@ -897,6 +1020,7 @@ export class SourceSearchService {
       sc?: Record<string, any>;
       accept?: string;
       timeout?: number;
+      extraHeaders?: Record<string, string>;
     },
   ): Promise<string> {
     const headers: Record<string, string> = {
@@ -908,6 +1032,16 @@ export class SourceSearchService {
     };
     const cookies = opts?.sc?.matchVideo?.cookies;
     if (cookies) headers.Cookie = cookies;
+    const referer = opts?.sc?.matchVideo?.addHeadersToVideo?.referer;
+    if (referer) headers.Referer = referer;
+    const ua = opts?.sc?.matchVideo?.addHeadersToVideo?.userAgent;
+    if (ua) headers['User-Agent'] = ua;
+    // 选源时前端带来的 headers 优先级更高
+    if (opts?.extraHeaders) {
+      for (const [k, v] of Object.entries(opts.extraHeaders)) {
+        if (v != null && String(v).trim()) headers[k] = String(v);
+      }
+    }
 
     const res = await outboundGet(url, {
       timeout: opts?.timeout ?? 10000,
