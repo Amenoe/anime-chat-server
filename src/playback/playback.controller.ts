@@ -103,42 +103,99 @@ export class PlaybackController {
     @Req() req,
     @Param('id') id: string,
     @Headers('range') range: string | undefined,
+    @Query('token') token: string | undefined,
     @Res() res: Response,
   ) {
     try {
+      const accessToken =
+        token ||
+        (typeof req.headers.authorization === 'string'
+          ? req.headers.authorization.replace(/^Bearer\s+/i, '')
+          : undefined);
       const result = await this.playbackService.openStream(
         id,
         req.user.user_id,
         range,
+        { accessToken },
       );
-      const { stream, contentType, size, start, end, partial } = result;
-
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Accept-Ranges', 'bytes');
-      res.setHeader('Cache-Control', 'no-store');
-
-      if (partial) {
-        res.status(206);
-        if (size > 0) {
-          res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
-        }
-        if (end >= start) {
-          res.setHeader('Content-Length', String(end - start + 1));
-        }
-      } else {
-        res.status(200);
-        if (size > 0) res.setHeader('Content-Length', String(size));
-      }
-
-      stream.on('error', () => {
-        if (!res.headersSent) res.status(500).end();
-        else res.end();
-      });
-      stream.pipe(res);
+      await this.pipeStreamResult(res, result);
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'stream error';
       if (e instanceof BadRequestException) throw e;
       throw new BadRequestException(msg);
     }
+  }
+
+  /**
+   * HLS 分片 / enc.key / 嵌套 m3u8 同源代理（由 stream 改写后的 playlist 引用）
+   */
+  @Get('sessions/:id/asset')
+  async asset(
+    @Req() req,
+    @Param('id') id: string,
+    @Query('url') url: string,
+    @Query('token') token: string | undefined,
+    @Headers('range') range: string | undefined,
+    @Res() res: Response,
+  ) {
+    if (!url?.trim()) {
+      throw new BadRequestException('url 必填');
+    }
+    try {
+      const accessToken =
+        token ||
+        (typeof req.headers.authorization === 'string'
+          ? req.headers.authorization.replace(/^Bearer\s+/i, '')
+          : undefined);
+      const result = await this.playbackService.openRemoteAsset(
+        id,
+        req.user.user_id,
+        url,
+        range,
+        { accessToken },
+      );
+      await this.pipeStreamResult(res, result);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'asset error';
+      if (e instanceof BadRequestException) throw e;
+      throw new BadRequestException(msg);
+    }
+  }
+
+  private async pipeStreamResult(
+    res: Response,
+    result: {
+      stream: NodeJS.ReadableStream;
+      contentType: string;
+      size: number;
+      start: number;
+      end: number;
+      partial: boolean;
+    },
+  ) {
+    const { stream, contentType, size, start, end, partial } = result;
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (partial) {
+      res.status(206);
+      if (size > 0) {
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
+      }
+      if (end >= start) {
+        res.setHeader('Content-Length', String(end - start + 1));
+      }
+    } else {
+      res.status(200);
+      if (size > 0) res.setHeader('Content-Length', String(size));
+    }
+
+    stream.on('error', () => {
+      if (!res.headersSent) res.status(500).end();
+      else res.end();
+    });
+    stream.pipe(res);
   }
 }

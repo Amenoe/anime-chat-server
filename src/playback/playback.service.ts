@@ -9,6 +9,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { createReadStream, existsSync, statSync } from 'fs';
 import { basename, isAbsolute, join, resolve } from 'path';
+import { Readable } from 'stream';
 import { Repository } from 'typeorm';
 import { playbackConfig, qbittorrentConfig } from '../core/config/config';
 import { outboundGet } from '../core/http/outbound';
@@ -188,7 +189,9 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     if (Object.keys(headers).length) {
       this.streamHeaders.set(session.id, headers);
     }
-    return this.toView(session, 'stream');
+    // m3u8 → hls（前端加 type=m3u8）；mp4 等仍为 stream progressive
+    const mode = this.looksLikeHlsPlaylist(url) ? 'hls' : 'stream';
+    return this.toView(session, mode);
   }
 
   async create(userId: string, dto: CreatePlaybackDto) {
@@ -265,7 +268,10 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
   async getSession(id: string, userId: string) {
     const session = await this.findOwned(id, userId);
     await this.refreshOne(session);
-    const mode = this.isStreamSession(session) ? 'stream' : 'progressive';
+    let mode: 'progressive' | 'stream' | 'hls' = 'progressive';
+    if (this.isStreamSession(session)) {
+      mode = this.looksLikeHlsPlaylist(session.source_uri) ? 'hls' : 'stream';
+    }
     return this.toView(session, mode);
   }
 
@@ -277,13 +283,14 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * 出流：
-   * 1) 流媒体：代理远端 URL（Range）
+   * 1) 流媒体：代理远端 URL（Range）；HLS playlist 会改写相对 URI 并同源代理分片/密钥
    * 2) BT：本地 qB 目录 Range
    */
   async openStream(
     id: string,
     userId: string,
     rangeHeader?: string,
+    opts?: { accessToken?: string },
   ): Promise<{
     stream: NodeJS.ReadableStream;
     contentType: string;
@@ -300,7 +307,7 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (this.isStreamSession(session)) {
-      return this.openRemoteStream(session, rangeHeader);
+      return this.openRemoteStream(session, rangeHeader, opts?.accessToken);
     }
 
     if (
@@ -336,11 +343,52 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
+  /**
+   * 代理 HLS 分片 / enc.key / 嵌套 m3u8（避免浏览器 CORS 与相对路径错解析）
+   */
+  async openRemoteAsset(
+    id: string,
+    userId: string,
+    remoteUrl: string,
+    rangeHeader?: string,
+    opts?: { accessToken?: string },
+  ): Promise<{
+    stream: NodeJS.ReadableStream;
+    contentType: string;
+    size: number;
+    start: number;
+    end: number;
+    partial: boolean;
+  }> {
+    const session = await this.findOwned(id, userId);
+    if (!this.isStreamSession(session)) {
+      throw new BadRequestException('仅流媒体会话支持 asset 代理');
+    }
+    const url = (remoteUrl || '').trim();
+    if (!/^https?:\/\//i.test(url)) {
+      throw new BadRequestException('asset url 无效');
+    }
+    // 仅允许 http(s)；防止 file:// 等
+    return this.proxyRemoteUrl(session, url, rangeHeader, opts?.accessToken);
+  }
+
   private async openRemoteStream(
     session: PlaybackSession,
     rangeHeader?: string,
+    accessToken?: string,
   ) {
-    const url = session.source_uri;
+    return this.proxyRemoteUrl(
+      session,
+      session.source_uri,
+      rangeHeader,
+      accessToken,
+    );
+  }
+
+  private buildRemoteHeaders(
+    session: PlaybackSession,
+    rangeHeader?: string,
+  ): Record<string, string> {
     const extra = this.streamHeaders.get(session.id) || {};
     const headers: Record<string, string> = {
       'User-Agent':
@@ -350,8 +398,50 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       ...extra,
     };
     if (rangeHeader) headers.Range = rangeHeader;
+    return headers;
+  }
+
+  private async proxyRemoteUrl(
+    session: PlaybackSession,
+    url: string,
+    rangeHeader?: string,
+    accessToken?: string,
+  ) {
+    const headers = this.buildRemoteHeaders(session, rangeHeader);
+    const treatAsHls =
+      this.looksLikeHlsPlaylist(url) ||
+      // 主 source 若是 m3u8，即使 content-type 怪异也按 playlist 处理
+      (url === session.source_uri &&
+        this.looksLikeHlsPlaylist(session.source_uri));
 
     try {
+      if (treatAsHls) {
+        // playlist 必须完整改写；忽略 Range，避免 206 半截 m3u8
+        const h = { ...headers };
+        delete h.Range;
+        delete h.range;
+        const res = await outboundGet<string>(url, {
+          responseType: 'text',
+          headers: h,
+          timeout: 60000,
+          maxRedirects: 5,
+          validateStatus: (s) => s >= 200 && s < 400,
+          transformResponse: [(d) => d],
+        });
+        const raw =
+          typeof res.data === 'string' ? res.data : String(res.data ?? '');
+        const rewritten = this.rewriteM3u8(raw, url, session.id, accessToken);
+        const buf = Buffer.from(rewritten, 'utf8');
+        return {
+          stream: Readable.from(buf),
+          contentType: 'application/vnd.apple.mpegurl',
+          size: buf.length,
+          start: 0,
+          end: Math.max(0, buf.length - 1),
+          partial: false,
+        };
+      }
+
       const res = await outboundGet(url, {
         responseType: 'stream',
         headers,
@@ -363,6 +453,10 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       const contentType =
         (res.headers['content-type'] as string) ||
         this.guessContentType(session.file_name || url);
+
+      // 源站把 m3u8 标成 octet-stream 时，嗅探首包会很麻烦；按 URL 已处理。
+      // 若误判为二进制但实际是 playlist，客户端会失败——looksLikeHls 覆盖常见路径。
+
       const contentLength = parseInt(
         String(res.headers['content-length'] || '0'),
         10,
@@ -403,6 +497,77 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException(
         '拉流失败：源站不可达或需要特殊鉴权，可换源或改用 BT',
       );
+    }
+  }
+
+  private looksLikeHlsPlaylist(url: string) {
+    return (
+      /\.m3u8(\?|$)/i.test(url || '') || /[?&]type=m3u8\b/i.test(url || '')
+    );
+  }
+
+  /**
+   * 将 m3u8 内相对路径 / 外链改为同源 asset 代理，使 enc.key 与 ts 不直连 CDN。
+   */
+  private rewriteM3u8(
+    body: string,
+    playlistUrl: string,
+    sessionId: string,
+    accessToken?: string,
+  ): string {
+    let base: URL;
+    try {
+      base = new URL(playlistUrl);
+    } catch {
+      return body;
+    }
+
+    const toProxy = (ref: string): string => {
+      const abs = this.resolveAgainstBase(ref, base);
+      if (!abs) return ref;
+      const q = new URLSearchParams();
+      q.set('url', abs);
+      if (accessToken) q.set('token', accessToken);
+      // 与全局 prefix /api 一致，供浏览器同源请求
+      return `/api/playback/sessions/${sessionId}/asset?${q.toString()}`;
+    };
+
+    return body
+      .split(/\r?\n/)
+      .map((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return line;
+
+        if (trimmed.startsWith('#')) {
+          // #EXT-X-KEY:...,URI="enc.key",...  / #EXT-X-MAP:URI="..."
+          // #EXT-X-MEDIA:...,URI="..."
+          return line.replace(
+            /URI\s*=\s*(["'])([^"']+)\1/gi,
+            (_m, quote: string, uri: string) => {
+              if (/^data:/i.test(uri)) return `URI=${quote}${uri}${quote}`;
+              return `URI=${quote}${toProxy(uri)}${quote}`;
+            },
+          );
+        }
+
+        // 分片或嵌套 playlist 行
+        if (/^https?:\/\//i.test(trimmed) || !trimmed.startsWith('#')) {
+          // 保留行首空白
+          const lead = line.match(/^\s*/)?.[0] || '';
+          return lead + toProxy(trimmed);
+        }
+        return line;
+      })
+      .join('\n');
+  }
+
+  private resolveAgainstBase(ref: string, base: URL): string | null {
+    const raw = (ref || '').trim();
+    if (!raw || raw.startsWith('#')) return null;
+    try {
+      return new URL(raw, base).toString();
+    } catch {
+      return null;
     }
   }
 
@@ -614,7 +779,7 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
 
   private toView(
     session: PlaybackSession,
-    playMode: 'progressive' | 'stream' = 'progressive',
+    playMode: 'progressive' | 'stream' | 'hls' = 'progressive',
   ) {
     const playable =
       session.status === 'playable' || session.status === 'ready';
