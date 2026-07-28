@@ -137,10 +137,7 @@ export class SourceSearchService {
     const all = await this.search(opts);
     const stream =
       all.find(
-        (c) =>
-          c.kind === 'stream' &&
-          c.resolved &&
-          /^https?:\/\//i.test(c.uri),
+        (c) => c.kind === 'stream' && c.resolved && /^https?:\/\//i.test(c.uri),
       ) ||
       all.find((c) => c.kind === 'stream' && /^https?:\/\//i.test(c.uri)) ||
       null;
@@ -357,16 +354,14 @@ export class SourceSearchService {
 
     const q = this.buildSearchKeyword(keyword, sc);
     // Animeko 用 path segment 编码，效果接近 encodeURIComponent
-    const searchUrl = template.replace(
-      /\{keyword\}/g,
-      encodeURIComponent(q),
-    );
+    const searchUrl = template.replace(/\{keyword\}/g, encodeURIComponent(q));
 
     let html: string;
     try {
       html = await this.fetchText(searchUrl, {
         sc,
-        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       });
     } catch (e) {
       this.logger.debug(
@@ -553,9 +548,7 @@ export class SourceSearchService {
       }
     }
     headers['User-Agent'] =
-      add.userAgent ||
-      sc.matchVideo?.addHeadersToVideo?.userAgent ||
-      UA;
+      add.userAgent || sc.matchVideo?.addHeadersToVideo?.userAgent || UA;
     if (sc.matchVideo?.cookies) headers.Cookie = sc.matchVideo.cookies;
     return headers;
   }
@@ -796,8 +789,7 @@ export class SourceSearchService {
       // 精确集数优先
       const prevExact =
         Number.isFinite(prev.sort) && Math.floor(prev.sort) === target;
-      const curExact =
-        Number.isFinite(e.sort) && Math.floor(e.sort) === target;
+      const curExact = Number.isFinite(e.sort) && Math.floor(e.sort) === target;
       if (curExact && !prevExact) byChannel.set(key, e);
     }
 
@@ -920,10 +912,7 @@ export class SourceSearchService {
     };
 
     // 1) MacCMS player_aaaa 优先（平衡括号 JSON，避免嵌套截断）
-    const aaaaJson = this.extractBalancedJsonObject(
-      html,
-      /player_aaaa\s*=/i,
-    );
+    const aaaaJson = this.extractBalancedJsonObject(html, /player_aaaa\s*=/i);
     if (aaaaJson) {
       try {
         const obj = JSON.parse(aaaaJson);

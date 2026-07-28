@@ -1,4 +1,8 @@
-import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Group } from '../group/entities/group.entity';
@@ -110,10 +114,7 @@ export class RoomService {
     return this.groupRepository.save(group);
   }
 
-  async transferHost(
-    groupId: string,
-    newHostUserId: string,
-  ): Promise<Group> {
+  async transferHost(groupId: string, newHostUserId: string): Promise<Group> {
     const group = await this.groupRepository.findOne({
       where: { group_id: groupId },
     });

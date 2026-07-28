@@ -341,11 +341,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   private async broadcastActiveUser(groupId: string): Promise<void> {
-    const count = this.roomOnlineCount(groupId);
+    const members = await this.getOnlineMembers(groupId);
     this.server.to(groupId).emit('activeGroupUser', {
       code: 200,
       message: '查询成功',
-      data: count,
+      // 兼容：data 仍为人数；members 为头像列表
+      data: members.length,
+      members,
       group_id: groupId,
     });
   }
@@ -433,6 +435,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         });
       }
 
+      // 进房前已在房内的 user_id，用于判断本次是否「新进入」
+      const beforeUserIds = new Set(this.getOnlineUserIds(group.group_id));
+
       client.join(group.group_id);
       meta.groupId = group.group_id;
       meta.seasonId = group.season_id;
@@ -442,7 +447,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const role = group.host_user_id === userId ? 'host' : 'viewer';
       const playbackState = this.roomService.toPlaybackState(group);
       const recentMessages = await this.fetchRecentMessages(group.group_id);
-      const onlineUsers = this.getOnlineUserIds(group.group_id);
+      const onlineUsers = await this.getOnlineMembers(group.group_id);
 
       client.emit('joinRoom', {
         code: 200,
@@ -455,6 +460,19 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
           online_users: onlineUsers,
         },
       });
+
+      // 该用户此前不在房内 → 向其他人广播「进入放映室」
+      if (!beforeUserIds.has(userId)) {
+        const joinUser = await this.userRepository.findOne({
+          where: { user_id: userId },
+        });
+        client.to(group.group_id).emit('roomNotice', {
+          type: 'join',
+          user_id: userId,
+          nickname: joinUser?.nickname || '用户',
+          time: Date.now(),
+        });
+      }
 
       await this.broadcastActiveUser(group.group_id);
     } catch (err: any) {
@@ -564,6 +582,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
             patch.playback_episode_sort = body.episode_sort;
           patch.playback_position = 0;
           patch.playback_status = 'idle';
+          // 切集清空旧源：让房主重新（自动）选源，观众旧视频停止
+          patch.playback_session_id = '';
+          patch.playback_stream_url = '';
+          patch.playback_title = '';
           break;
         case 'set_source':
           if (body.stream_url != null)
@@ -641,6 +663,22 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         return;
       }
 
+      // 该用户已无残留 socket 在房 → 向剩余成员广播「离开」
+      if (userId) {
+        const stillOnline = this.getOnlineUserIds(groupId).includes(userId);
+        if (!stillOnline) {
+          const leaveUser = await this.userRepository.findOne({
+            where: { user_id: userId },
+          });
+          this.server.to(groupId).emit('roomNotice', {
+            type: 'leave',
+            user_id: userId,
+            nickname: leaveUser?.nickname || '用户',
+            time: Date.now(),
+          });
+        }
+      }
+
       if (userId) {
         const group = await this.groupRepository.findOne({
           where: { group_id: groupId },
@@ -692,6 +730,26 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       if (meta?.userId) users.add(meta.userId);
     }
     return Array.from(users);
+  }
+
+  /** 在线成员（去重 user_id）含昵称头像，供聊天栏展示 */
+  private async getOnlineMembers(
+    groupId: string,
+  ): Promise<Array<{ user_id: string; nickname: string; avatar: string }>> {
+    const ids = this.getOnlineUserIds(groupId);
+    if (!ids.length) return [];
+    const users = await this.userRepository.find({
+      where: ids.map((user_id) => ({ user_id })),
+    });
+    const map = new Map(users.map((u) => [u.user_id, u]));
+    return ids.map((user_id) => {
+      const u = map.get(user_id);
+      return {
+        user_id,
+        nickname: u?.nickname || '用户',
+        avatar: u?.avatar || '',
+      };
+    });
   }
 
   private async fetchRecentMessages(
