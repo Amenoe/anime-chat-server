@@ -57,6 +57,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   private readonly lastPlaybackWrite = new Map<string, number>();
   private readonly PLAYBACK_WRITE_THROTTLE = 2000;
+  private readonly lastPlaybackBroadcast = new Map<string, number>();
+  private readonly PLAYBACK_BROADCAST_THROTTLE = 1000;
 
   async handleConnection(client: Socket): Promise<void> {
     const raw = (client.handshake as any)?.query?.user_id;
@@ -85,6 +87,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   /**
    * 加入或创建番剧聊天室
    * body: { anime_id, group_name? } 或兼容旧客户端直接传 anime_id 数字
+   * @deprecated 放映室已统一走 joinRoom；此路径仅为旧客户端兼容保留，
+   * 会创建无 season_id 的 group（listByAnime 已过滤），后续可移除。
    */
   @SubscribeMessage('addGroup')
   async addGroup(
@@ -603,6 +607,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       const isHeartbeat = body.action === 'heartbeat';
       let shouldWriteDb = true;
+      let shouldBroadcast = true;
 
       if (isHeartbeat) {
         const now = Date.now();
@@ -611,6 +616,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
           shouldWriteDb = false;
         } else {
           this.lastPlaybackWrite.set(body.group_id, now);
+        }
+        // 心跳只用于进度校准，1s 内不重复广播避免观众端频繁 seek
+        const lastB = this.lastPlaybackBroadcast.get(body.group_id) || 0;
+        if (now - lastB < this.PLAYBACK_BROADCAST_THROTTLE) {
+          shouldBroadcast = false;
+        } else {
+          this.lastPlaybackBroadcast.set(body.group_id, now);
         }
       }
 
@@ -625,21 +637,23 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         Object.assign(updated, patch);
       }
 
-      this.server.to(body.group_id).emit('playback:state', {
-        group_id: updated.group_id,
-        season_id: updated.season_id,
-        status: updated.playback_status,
-        episode_id: updated.playback_episode_id,
-        episode_sort: updated.playback_episode_sort,
-        session_id: updated.playback_session_id,
-        stream_url: updated.playback_stream_url,
-        position: updated.playback_position,
-        paused: updated.playback_status === 'paused',
-        title: updated.playback_title,
-        host_user_id: updated.host_user_id,
-        server_time: Date.now(),
-        updated_at: updated.playback_updated_at,
-      });
+      if (shouldBroadcast) {
+        this.server.to(body.group_id).emit('playback:state', {
+          group_id: updated.group_id,
+          season_id: updated.season_id,
+          status: updated.playback_status,
+          episode_id: updated.playback_episode_id,
+          episode_sort: updated.playback_episode_sort,
+          session_id: updated.playback_session_id,
+          stream_url: updated.playback_stream_url,
+          position: updated.playback_position,
+          paused: updated.playback_status === 'paused',
+          title: updated.playback_title,
+          host_user_id: updated.host_user_id,
+          server_time: Date.now(),
+          updated_at: updated.playback_updated_at,
+        });
+      }
     } catch (err: any) {
       // eslint-disable-next-line no-console
       console.error('[playback:control] failed', err);
