@@ -12,6 +12,7 @@ import {
   Req,
   UploadedFile,
   BadRequestException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 // multer 为 @nestjs/platform-express 传递依赖；无 @types/multer 时用 require
@@ -81,7 +82,14 @@ export class UserController {
    */
   @UseGuards(AuthGuard('jwt'))
   @Patch('status/:id')
-  updateStatus(@Param('id') id: string, @Body() updateUserDto: UpdateUserDto) {
+  updateStatus(
+    @Req() req,
+    @Param('id') id: string,
+    @Body() updateUserDto: UpdateUserDto,
+  ) {
+    if (id !== req.user.user_id && req.user.role !== 'root') {
+      throw new ForbiddenException('只能修改自己的在线状态');
+    }
     return this.userService.updateStatus(id, updateUserDto);
   }
 
@@ -96,7 +104,14 @@ export class UserController {
    */
   @UseGuards(AuthGuard('jwt'))
   @Patch(':id')
-  update(@Param('id') id: string, @Body() updateUserDto: UpdateUserDto) {
+  update(
+    @Req() req,
+    @Param('id') id: string,
+    @Body() updateUserDto: UpdateUserDto,
+  ) {
+    if (id !== req.user.user_id && req.user.role !== 'root') {
+      throw new ForbiddenException('只能修改自己的资料');
+    }
     return this.userService.update(id, updateUserDto);
   }
 
@@ -105,7 +120,10 @@ export class UserController {
    */
   @UseGuards(AuthGuard('jwt'))
   @Delete(':id')
-  delete(@Param('id') id: string) {
+  delete(@Req() req, @Param('id') id: string) {
+    if (id !== req.user.user_id && req.user.role !== 'root') {
+      throw new ForbiddenException('只能删除自己的账号');
+    }
     return this.userService.delete(id);
   }
 }

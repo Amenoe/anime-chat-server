@@ -141,6 +141,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     meta.seasonId = group.season_id ?? null;
     meta.joinedAt = Date.now();
     this.socketMeta.set(client.id, meta);
+    await this.upsertGroupUser(group.group_id, meta.userId ?? '');
 
     // 只回给当前连接，避免别人被切房
     client.emit('addGroup', group);
@@ -443,6 +444,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       meta.seasonId = group.season_id;
       meta.joinedAt = Date.now();
       this.socketMeta.set(client.id, meta);
+      await this.upsertGroupUser(group.group_id, userId);
 
       const role = group.host_user_id === userId ? 'host' : 'viewer';
       const playbackState = this.roomService.toPlaybackState(group);
@@ -667,6 +669,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       if (userId) {
         const stillOnline = this.getOnlineUserIds(groupId).includes(userId);
         if (!stillOnline) {
+          // 离开房间后不再保留拉流权限（playback 鉴权依赖 GroupUserMap）
+          await this.groupUserRepository.delete({
+            group_id: groupId,
+            user_id: userId,
+          });
           const leaveUser = await this.userRepository.findOne({
             where: { user_id: userId },
           });
@@ -785,5 +792,20 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         };
       })
       .reverse();
+  }
+
+  /** 进房/建房时写入成员映射，播放流鉴权（findOwned）依赖它 */
+  private async upsertGroupUser(
+    groupId: string,
+    userId: string,
+  ): Promise<void> {
+    if (!groupId || !userId) return;
+    const exist = await this.groupUserRepository.findOne({
+      where: { group_id: groupId, user_id: userId },
+    });
+    if (exist) return;
+    await this.groupUserRepository.save(
+      this.groupUserRepository.create({ group_id: groupId, user_id: userId }),
+    );
   }
 }
