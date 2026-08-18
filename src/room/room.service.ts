@@ -12,15 +12,19 @@ import { CreateRoomDto } from './dto/create-room.dto';
 import { generateSeasonId } from '../utils/id';
 
 export interface PlaybackStateView {
+  group_id: string;
   season_id: string;
-  playback_status: string;
-  playback_episode_id: number | null;
-  playback_episode_sort: number | null;
-  playback_session_id: string;
-  playback_stream_url: string | null;
-  playback_position: number;
-  playback_updated_at: Date | null;
-  playback_title: string;
+  status: string;
+  episode_id: number | null;
+  episode_sort: number | null;
+  session_id: string;
+  stream_url: string | null;
+  position: number;
+  paused: boolean;
+  title: string;
+  host_user_id: string;
+  server_time: number;
+  updated_at: Date | null;
 }
 
 @Injectable()
@@ -75,15 +79,19 @@ export class RoomService {
 
   toPlaybackState(group: Group): PlaybackStateView {
     return {
+      group_id: group.group_id,
       season_id: group.season_id,
-      playback_status: group.playback_status,
-      playback_episode_id: group.playback_episode_id,
-      playback_episode_sort: group.playback_episode_sort,
-      playback_session_id: group.playback_session_id,
-      playback_stream_url: group.playback_stream_url,
-      playback_position: group.playback_position,
-      playback_updated_at: group.playback_updated_at,
-      playback_title: group.playback_title,
+      status: group.playback_status,
+      episode_id: group.playback_episode_id,
+      episode_sort: group.playback_episode_sort,
+      session_id: group.playback_session_id,
+      stream_url: group.playback_stream_url,
+      position: group.playback_position,
+      paused: group.playback_status === 'paused',
+      title: group.playback_title,
+      host_user_id: group.host_user_id,
+      server_time: Date.now(),
+      updated_at: group.playback_updated_at,
     };
   }
 
