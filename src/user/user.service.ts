@@ -13,6 +13,7 @@ import { UpdateUserDto } from './dto/update-user.dto';
 import { User } from './entities/user.entity';
 import { MinioService } from '../storage/minio.service';
 import { minioConfig } from '../core/config/config';
+import { RefreshTokenService } from '../auth/refresh-token.service';
 
 /** multer 内存存储的文件形状（避免强依赖 @types/multer） */
 export type UploadedAvatarFile = {
@@ -38,6 +39,7 @@ export class UserService {
     @InjectRepository(User)
     private userRepository: Repository<User>,
     private readonly minioService: MinioService,
+    private readonly refreshTokenService: RefreshTokenService,
   ) {}
 
   async register(createUserDto: CreateUserDto) {
@@ -102,6 +104,10 @@ export class UserService {
     const result = await this.userRepository.update(id, patch);
     if (result.affected === 0) {
       throw new BadRequestException('更新失败');
+    }
+    // 改密后吊销全部 refreshToken：其他设备的会话无法再静默续期
+    if (patch.password) {
+      await this.refreshTokenService.revokeAllForUser(id);
     }
     return await this.findOne(id);
   }
@@ -184,6 +190,8 @@ export class UserService {
     if (result.affected === 0) {
       throw new BadRequestException('删除失败');
     }
+    // 账号已删，其 refreshToken 必须一并作废，避免残留会话
+    await this.refreshTokenService.revokeAllForUser(id);
     return result;
   }
 }

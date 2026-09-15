@@ -9,16 +9,28 @@ import { JwtModule } from '@nestjs/jwt';
 import { jwtConfig } from 'src/core/config/config';
 import { JwtStrategy } from './jwt.strategy';
 import { UserService } from 'src/user/user.service';
+import { RefreshToken } from './entities/refresh-token.entity';
+import { RefreshTokenService } from './refresh-token.service';
 
 const jwtModule = JwtModule.register({
   secret: jwtConfig.secret,
-  signOptions: { expiresIn: '3d' }, //签名有效时间
+  signOptions: { expiresIn: jwtConfig.accessExpiresIn }, //accessToken 有效期
 });
 
 @Module({
-  imports: [TypeOrmModule.forFeature([User]), PassportModule, jwtModule],
+  imports: [
+    TypeOrmModule.forFeature([User, RefreshToken]),
+    PassportModule,
+    jwtModule,
+  ],
   controllers: [AuthController],
-  providers: [AuthService, LocalStrategy, JwtStrategy, UserService],
-  exports: [jwtModule],
+  providers: [
+    AuthService,
+    LocalStrategy,
+    JwtStrategy,
+    UserService,
+    RefreshTokenService,
+  ],
+  exports: [jwtModule, AuthService, RefreshTokenService],
 })
 export class AuthModule {}
