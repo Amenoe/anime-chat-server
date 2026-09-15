@@ -11,12 +11,29 @@
 | 开发 | `.env.development` | `pnpm start:dev`  |
 | 生产 | `.env.production`  | `pnpm start:prod` |
 
-| 变量                  | 说明                                                           |
-| --------------------- | -------------------------------------------------------------- |
-| `DB_*` / `JWT_SECRET` | MySQL / JWT                                                    |
-| `MINIO_*`             | 头像对象存储                                                   |
-| `QB_*`                | qBittorrent（BT 边下边播）                                     |
-| `OUTBOUND_PROXY`      | **可选**。搜源在浏览器完成，服务器通常不需要；仅运维代拉时配置 |
+| 变量                     | 说明                                                                                             |
+| ------------------------ | ------------------------------------------------------------------------------------------------ |
+| `DB_*`                   | MySQL 连接                                                                                       |
+| `JWT_SECRET`             | accessToken 签名密钥                                                                             |
+| `JWT_REFRESH_SECRET`     | **可选**。refreshToken 专用密钥；缺省由 `JWT_SECRET` 派生（`":refresh"` 后缀）。生产建议显式设置 |
+| `JWT_ACCESS_EXPIRES_IN`  | **可选**。accessToken 有效期，默认 `2h`                                                          |
+| `JWT_REFRESH_EXPIRES_IN` | **可选**。refreshToken 有效期，默认 `30d`                                                        |
+| `MINIO_*`                | 头像对象存储                                                                                     |
+| `QB_*`                   | qBittorrent（BT 边下边播）                                                                       |
+| `OUTBOUND_PROXY`         | **可选**。搜源在浏览器完成，服务器通常不需要；仅运维代拉时配置                                   |
+
+## 鉴权（双 token）
+
+| 接口                     | 说明                                                             |
+| ------------------------ | ---------------------------------------------------------------- |
+| `POST /api/auth/login`   | 签发 accessToken（短时效，不落库）+ refreshToken（长时效，落库） |
+| `POST /api/auth/refresh` | 用 refreshToken 换一对新 token；**轮换**，旧的立即作废           |
+| `POST /api/auth/logout`  | 吊销传入的 refreshToken                                          |
+
+- `refresh_token` 表只存 `sha256(jwt)`，明文只在登录/刷新响应出现一次
+- 已作废 refreshToken 被再次使用 → 判定泄露，吊销该用户全部会话
+- 改密、删号会吊销该用户全部 refreshToken
+- 业务接口只接受 accessToken（`typ=access`），refreshToken 访问会 401
 
 ## 数据源
 
@@ -50,7 +67,10 @@ BT 需 `QB_ENABLED=true` + docker-compose.playback.yml。
 - 同房拉流：播放会话带 `group_id`，`openStream` 鉴权 = 属主 / 房主 / `group_user_map` 成员
 - 房主离开 → 转让最早加入者；空房 → 硬删消息/成员映射/房间
 
-核心设计决策与任务看板见 [docs/PROJECT_MEMORY.md](../docs/PROJECT_MEMORY.md)。
+核心设计决策与任务看板见 [docs/PROJECT_MEMORY.md](../docs/PROJECT_MEMORY.md)，
+接口契约见 [docs/api-contract.md](../docs/api-contract.md)，表结构见 [docs/schema.sql](../docs/schema.sql)。
+
+> 改实体后请同步更新 `docs/schema.sql`：生产环境关闭 `synchronize`，建库依赖该文件。
 
 ---
 
