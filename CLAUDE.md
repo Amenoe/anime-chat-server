@@ -110,4 +110,11 @@ pnpm exec tsc --noEmit -p tsconfig.build.json && pnpm run build   # 必过
 NODE_ENV=development node dist/main.js                            # 真实启动，确认 DI 与路由
 ```
 
-鉴权等核心链路建议写好一次性脚本打真实接口（注册 → 登录 → 业务接口 → 刷新 → 登出 → 清理）。
+鉴权链路已有可重复执行的验收脚本（**改鉴权后必须跑**）：
+
+```bash
+node scripts/auth-e2e.mjs                    # 默认打 127.0.0.1:3000
+BASE=http://127.0.0.1:3000/api node scripts/auth-e2e.mjs
+```
+
+覆盖登录 → 鉴权 → 刷新轮换 → 复用检测 → 登出 → 改密 → 删号，24 项断言，测试账号自动清理。
