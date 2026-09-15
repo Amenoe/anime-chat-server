@@ -22,7 +22,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   }
 
   /** 校验 JWT payload 对应用户仍存在，挂到 req.user */
-  async validate(payload: { user_id: string; username: string }) {
+  async validate(payload: { user_id: string; username: string; typ?: string }) {
+    // 只有 accessToken 能访问业务接口；refreshToken 仅限 POST /auth/refresh
+    if (payload.typ === 'refresh') {
+      throw new UnauthorizedException('token 类型不正确');
+    }
     const existUser = await this.userRepository.findOne({
       where: { user_id: payload.user_id },
     });

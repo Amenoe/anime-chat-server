@@ -35,8 +35,33 @@ export const appConfig = {
   isProd: nodeEnv === 'production',
 };
 
+function durationToSeconds(value: string): number {
+  const match = value.trim().match(/^(\d+(?:\.\d+)?)([smhd]?)$/i);
+  if (!match) throw new Error(`Invalid JWT duration: ${value}`);
+  const amount = Number(match[1]);
+  const unit = (match[2] || 's').toLowerCase();
+  return amount * ({ s: 1, m: 60, h: 3600, d: 86400 }[unit] || 1);
+}
+
+/**
+ * 双 token：
+ *   accessToken  —— 随请求头下发，短时效（默认 2h），不落库
+ *   refreshToken —— 仅用于 /api/auth/refresh 换新，长时效（默认 30d），落库可吊销
+ * JWT_REFRESH_SECRET 缺省时由主密钥派生，避免与 accessToken 混用同一密钥。
+ */
 export const jwtConfig = {
   secret: required('JWT_SECRET', 'dev-only-change-me'),
+  refreshSecret:
+    process.env.JWT_REFRESH_SECRET ||
+    `${required('JWT_SECRET', 'dev-only-change-me')}:refresh`,
+  accessExpiresIn: process.env.JWT_ACCESS_EXPIRES_IN || '2h',
+  refreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d',
+  accessExpiresInSec: durationToSeconds(
+    process.env.JWT_ACCESS_EXPIRES_IN || '2h',
+  ),
+  refreshExpiresInSec: durationToSeconds(
+    process.env.JWT_REFRESH_EXPIRES_IN || '30d',
+  ),
 };
 
 export const DBConifg = {
