@@ -358,7 +358,8 @@ export class AiService {
       res.on('close', onClose);
 
       upstream.on('data', (chunk: Buffer) => {
-        buffer += decoder.write(chunk);
+        // 统一换行再解析：这样 `\n\n` 分块对 CRLF 的上游也成立
+        buffer += decoder.write(chunk).replace(/\r\n/g, '\n');
         let idx: number;
         while ((idx = buffer.indexOf('\n\n')) !== -1) {
           const block = buffer.slice(0, idx);
@@ -367,9 +368,12 @@ export class AiService {
           if (!parsed) {
             continue;
           }
-          // 原样转发（保持 `data:` 后无空格，与 anime-ai 一致）
+          // **原样转发上游的事件块**。
+          // 曾在这里重新拼成 `event: ${name}\ndata:${data}`，结果网关多出一个空格，
+          // 与 anime-ai 直出的 `event:name` 不一致 —— 同一个协议出现两种线格式，
+          // 排查时要分别对照。透传原始块就不会有这种偏差。
           if (!res.writableEnded) {
-            res.write(`event: ${parsed.event}\ndata:${parsed.data}\n\n`);
+            res.write(`${block}\n\n`);
           }
           switch (parsed.event) {
             case EV.TEXT_DELTA:
