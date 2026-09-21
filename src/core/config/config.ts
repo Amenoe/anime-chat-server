@@ -120,3 +120,31 @@ export const playbackConfig = {
 export const outboundConfig = {
   proxyUrl: (process.env.OUTBOUND_PROXY || '').trim(),
 };
+
+/**
+ * AI 网关：把前端的对话请求转发到 anime-ai 服务（Spring Boot，默认 8013）。
+ *
+ * 职责边界：本服务负责鉴权、配额、会话落库与 SSE 透传；
+ * 检索与模型编排在 anime-ai，**本服务不碰检索逻辑**。
+ *
+ * 会话历史的权威来源是这里的 MySQL —— anime-ai 是无状态的，
+ * 每次请求由本服务把历史窗口一并送过去。所以 `historyWindow` 是**唯一**的窗口裁剪点。
+ */
+export const aiConfig = {
+  serviceUrl: (process.env.AI_SERVICE_URL || 'http://127.0.0.1:8013').replace(
+    /\/+$/,
+    '',
+  ),
+  /** 必须与 anime-ai 的 `ai.internal-token` 一致，否则被拒 401 */
+  internalToken: process.env.AI_INTERNAL_TOKEN || '',
+  /** 每日每人对话配额（次）。<= 0 表示不限量（仅供本地调试） */
+  dailyQuota: Number(process.env.AI_DAILY_QUOTA || 50),
+  /** 单条用户消息长度上限，与 anime-ai 侧 DTO 保持一致 */
+  maxMessageLength: Number(process.env.AI_MAX_MESSAGE_LENGTH || 2000),
+  /** 每次送给模型的最近消息条数（唯一的历史裁剪点） */
+  historyWindow: Number(process.env.AI_HISTORY_WINDOW || 20),
+  /** 建连/首字节超时；流式开始后由 streamTimeoutMs 兜底 */
+  upstreamTimeoutMs: Number(process.env.AI_UPSTREAM_TIMEOUT_MS || 30000),
+  /** 单次流式总时限，需大于 anime-ai 侧模型超时（60s） */
+  streamTimeoutMs: Number(process.env.AI_STREAM_TIMEOUT_MS || 180000),
+};
