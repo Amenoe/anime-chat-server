@@ -1,7 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { clampDays, clampLimit, rowToNumbers, toNumbers } from 'src/core/utils/sql';
+import {
+  clampDays,
+  clampLimit,
+  rowToNumbers,
+  toNumbers,
+} from 'src/core/utils/sql';
 import { TrackEvent } from './entities/track-event.entity';
 
 /** 一条待写入的埋点事件 */
@@ -86,7 +91,12 @@ export class TrackService {
       [safeDays],
     )) as Array<Record<string, unknown>>;
     return row
-      ? rowToNumbers(row, ['total_events', 'users', 'event_types', 'today_events'])
+      ? rowToNumbers(row, [
+          'total_events',
+          'users',
+          'event_types',
+          'today_events',
+        ])
       : {};
   }
 

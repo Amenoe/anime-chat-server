@@ -13,7 +13,12 @@ import { Readable } from 'stream';
 import { StringDecoder } from 'string_decoder';
 import { Repository } from 'typeorm';
 import { aiConfig } from 'src/core/config/config';
-import { clampDays, clampLimit, rowToNumbers, toNumbers } from 'src/core/utils/sql';
+import {
+  clampDays,
+  clampLimit,
+  rowToNumbers,
+  toNumbers,
+} from 'src/core/utils/sql';
 import { ChatDto } from './dto/chat.dto';
 import { AiConversation } from './entities/ai-conversation.entity';
 import { AiMessage } from './entities/ai-message.entity';
@@ -128,9 +133,17 @@ export class AiService {
     )) as Array<Record<string, unknown>>;
     return row
       ? rowToNumbers(row, [
-          'total_requests', 'ok_requests', 'error_requests', 'aborted_requests',
-          'prompt_tokens', 'completion_tokens', 'tool_calls', 'users',
-          'avg_latency_ms', 'avg_first_token_ms', 'today_requests',
+          'total_requests',
+          'ok_requests',
+          'error_requests',
+          'aborted_requests',
+          'prompt_tokens',
+          'completion_tokens',
+          'tool_calls',
+          'users',
+          'avg_latency_ms',
+          'avg_first_token_ms',
+          'today_requests',
         ])
       : {};
   }
@@ -155,7 +168,12 @@ export class AiService {
       [EV_AI_CHAT, safeDays],
     )) as Array<Record<string, unknown>>;
     return toNumbers(rows, [
-      'requests', 'users', 'prompt_tokens', 'completion_tokens', 'tool_calls', 'avg_latency_ms',
+      'requests',
+      'users',
+      'prompt_tokens',
+      'completion_tokens',
+      'tool_calls',
+      'avg_latency_ms',
     ]);
   }
 
