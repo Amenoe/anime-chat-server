@@ -13,10 +13,13 @@ import { Readable } from 'stream';
 import { StringDecoder } from 'string_decoder';
 import { Repository } from 'typeorm';
 import { aiConfig } from 'src/core/config/config';
+import { clampDays, clampLimit, rowToNumbers, toNumbers } from 'src/core/utils/sql';
 import { ChatDto } from './dto/chat.dto';
 import { AiConversation } from './entities/ai-conversation.entity';
 import { AiMessage } from './entities/ai-message.entity';
 import { AiUsage } from './entities/ai-usage.entity';
+import { TrackEvent } from 'src/track/entities/track-event.entity';
+import { TrackService } from 'src/track/track.service';
 
 /** 会话列表项 */
 export interface ConversationItem {
@@ -28,6 +31,12 @@ export interface ConversationItem {
 }
 
 /** SSE 事件名，与 anime-ai 的 SseEvent 一一对应 */
+/** 一个 AI 对话请求对应的事件名（前后端埋点共用这张表） */
+const EV_AI_CHAT = 'ai.chat';
+
+/** 请求终态。client_abort 单列，避免用户中途离开被算成服务错误 */
+type AiEventStatus = 'ok' | 'error' | 'client_abort';
+
 const EV = {
   TEXT_DELTA: 'text-delta',
   TOOL_CALL: 'tool-call',
@@ -54,6 +63,9 @@ export class AiService {
     private readonly messageRepo: Repository<AiMessage>,
     @InjectRepository(AiUsage)
     private readonly usageRepo: Repository<AiUsage>,
+    @InjectRepository(TrackEvent)
+    private readonly trackRepo: Repository<TrackEvent>,
+    private readonly trackService: TrackService,
   ) {}
 
   // ── 会话查询 ────────────────────────────────────────────────
@@ -84,6 +96,111 @@ export class AiService {
     await this.findOwnedConversation(userId, conversationId);
     await this.messageRepo.delete({ conversation_id: conversationId });
     await this.conversationRepo.delete({ id: conversationId });
+  }
+
+  // ── 用量统计（管理员看板用，见 docs 里的「后续管理员界面」）─────
+
+  /**
+   * 总览。
+   *
+   * `client_abort` 单列：用户中途关页面/点停止不该算进错误率，否则会冤枉服务质量。
+   *
+   * 数据来自通用埋点表 `track_event`（`event = 'ai.chat'`），数值属性存在 `props` JSON 里，
+   * 所以要用 `props->>'$.xxx'` 提取。可读性不如专用表，但换来「前后端埋点共用一张表」。
+   * 量级上来后应先加物化汇总表，而不是给通用表加业务列。
+   */
+  async statsOverview() {
+    const [row] = (await this.trackRepo.query(
+      `SELECT COUNT(*)                                                AS total_requests,
+              SUM(props->>'$.status' = 'ok')                          AS ok_requests,
+              SUM(props->>'$.status' = 'error')                       AS error_requests,
+              SUM(props->>'$.status' = 'client_abort')                AS aborted_requests,
+              COALESCE(SUM(CAST(props->>'$.promptTokens' AS UNSIGNED)), 0)     AS prompt_tokens,
+              COALESCE(SUM(CAST(props->>'$.completionTokens' AS UNSIGNED)), 0) AS completion_tokens,
+              COALESCE(SUM(CAST(props->>'$.toolCalls' AS UNSIGNED)), 0)        AS tool_calls,
+              COUNT(DISTINCT user_id)                                 AS users,
+              COALESCE(ROUND(AVG(CAST(props->>'$.latencyMs' AS UNSIGNED))), 0)    AS avg_latency_ms,
+              COALESCE(ROUND(AVG(CAST(props->>'$.firstTokenMs' AS UNSIGNED))), 0) AS avg_first_token_ms,
+              SUM(create_time >= CURDATE())                           AS today_requests
+       FROM track_event
+       WHERE event = ?`,
+      [EV_AI_CHAT],
+    )) as Array<Record<string, unknown>>;
+    return row
+      ? rowToNumbers(row, [
+          'total_requests', 'ok_requests', 'error_requests', 'aborted_requests',
+          'prompt_tokens', 'completion_tokens', 'tool_calls', 'users',
+          'avg_latency_ms', 'avg_first_token_ms', 'today_requests',
+        ])
+      : {};
+  }
+
+  /** 按天趋势，默认最近 14 天 */
+  async statsDaily(days = 14) {
+    const safeDays = clampDays(days);
+    const rows = (await this.trackRepo.query(
+      // DATE_FORMAT 而不是 DATE()：DATE() 会以 Date 对象返回，JSON 化成 UTC 时间戳
+      // （`2026-09-21` 变成 `2026-09-20T16:00:00Z`），看板上日期会整体差一天。
+      `SELECT DATE_FORMAT(create_time, '%Y-%m-%d')                                      AS day,
+              COUNT(*)                                                  AS requests,
+              COUNT(DISTINCT user_id)                                   AS users,
+              COALESCE(SUM(CAST(props->>'$.promptTokens' AS UNSIGNED)), 0)     AS prompt_tokens,
+              COALESCE(SUM(CAST(props->>'$.completionTokens' AS UNSIGNED)), 0) AS completion_tokens,
+              COALESCE(SUM(CAST(props->>'$.toolCalls' AS UNSIGNED)), 0)        AS tool_calls,
+              COALESCE(ROUND(AVG(CAST(props->>'$.latencyMs' AS UNSIGNED))), 0) AS avg_latency_ms
+       FROM track_event
+       WHERE event = ? AND create_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       GROUP BY day
+       ORDER BY day DESC`,
+      [EV_AI_CHAT, safeDays],
+    )) as Array<Record<string, unknown>>;
+    return toNumbers(rows, [
+      'requests', 'users', 'prompt_tokens', 'completion_tokens', 'tool_calls', 'avg_latency_ms',
+    ]);
+  }
+
+  /**
+   * 工具使用分布。
+   *
+   * 按「组合」分组（`browse_anime` 与 `browse_anime,search_anime` 各算一组），
+   * 而不是拆成单个工具 —— MySQL 没有内置字符串拆分，为此拉全表到应用层聚合不划算。
+   * 组合视角本身也有信息量：能看出模型是否倾向一轮连调多个工具。
+   */
+  async statsTools(days = 14) {
+    const safeDays = clampDays(days);
+    const rows = (await this.trackRepo.query(
+      `SELECT COALESCE(NULLIF(props->>'$.toolNames', '[]'), '(无工具)') AS tools,
+              COUNT(*)                                                  AS requests,
+              COALESCE(SUM(CAST(props->>'$.toolCalls' AS UNSIGNED)), 0)  AS calls
+       FROM track_event
+       WHERE event = ? AND create_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       GROUP BY tools
+       ORDER BY requests DESC
+       LIMIT 20`,
+      [EV_AI_CHAT, safeDays],
+    )) as Array<Record<string, unknown>>;
+    return toNumbers(rows, ['requests', 'calls']);
+  }
+
+  /** 用量最高的用户，便于发现异常账号 */
+  async statsTopUsers(days = 14, limit = 20) {
+    const safeDays = clampDays(days);
+    const safeLimit = clampLimit(limit, 20, 100);
+    const rows = (await this.trackRepo.query(
+      // 注意 `+` 两侧都要各自 CAST：`props->>` 取出来是**字符串**，
+      // 不 CAST 的话 `+` 会做字符串拼接，SUM 出来的结果毫无意义（本开发过程中踩到 500）。
+      `SELECT user_id,
+              COUNT(*) AS requests,
+              COALESCE(SUM(CAST(props->>'$.promptTokens' AS UNSIGNED)
+                         + CAST(props->>'$.completionTokens' AS UNSIGNED)), 0) AS tokens
+       FROM track_event
+       WHERE event = ? AND create_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       GROUP BY user_id
+       ORDER BY requests DESC
+       LIMIT ?`,
+      [EV_AI_CHAT, safeDays, safeLimit],
+    )) as Array<Record<string, unknown>>;
+    return toNumbers(rows, ['requests', 'tokens']);
   }
 
   // ── 对话主流程 ──────────────────────────────────────────────
@@ -319,6 +436,18 @@ export class AiService {
     let completionTokens = 0;
     let finished = false;
 
+    // ── 遥测（写 ai_request_log 用）──────────────────────────
+    const startedAt = Date.now();
+    /** 首字延迟：比整轮耗时更贴近「体感快不快」 */
+    let firstTokenMs: number | null = null;
+    const toolNames = new Set<string>();
+    let toolCalls = 0;
+    let status: AiEventStatus = 'ok';
+    let finishReason: string | null = null;
+    let model: string | null = null;
+    /** 上游是否已正常收尾；未收尾就 close = 用户中途跑了 */
+    let upstreamEnded = false;
+
     const userId = (res.req as unknown as { user?: { user_id: string } })?.user
       ?.user_id;
 
@@ -342,6 +471,27 @@ export class AiService {
         if (userId) {
           await this.addTokens(userId, promptTokens, completionTokens);
         }
+        // 明细改为**埋点事件**上报：与前端行为埋点共用一条写入路径与一张表，
+        // 管理员看板就不必为「AI 明细」单独写一套查询。
+        await this.trackService.trackOne(EV_AI_CHAT, {
+          userId,
+          page: 'Ai',
+          target: 'chat',
+          props: {
+            conversationId,
+            model,
+            promptTokens,
+            completionTokens,
+            toolCalls,
+            toolNames: toolNames.size ? [...toolNames] : [],
+            latencyMs: Date.now() - startedAt,
+            firstTokenMs,
+            status,
+            finishReason,
+            // 工具命中条数：能看出「模型取了多少候选才筛出推荐」
+            candidateCount: subjects.length,
+          },
+        });
       } catch (e) {
         // 落库失败不能影响已完成的对话；但要留痕，否则配额与历史会静默错账
         this.logger.error(
@@ -352,7 +502,12 @@ export class AiService {
 
     return new Promise<void>((resolve) => {
       const onClose = () => {
-        // 客户端断开（关页面/切走）：停掉上游，但仍要落库已生成的内容与用量
+        // 客户端断开（关页面/切走）：停掉上游，但仍要落库已生成的内容与用量。
+        // 上游还没收尾就说明是用户中途跑了，单独标 client_abort ——
+        // 把它算进「错误率」会冤枉服务质量。
+        if (!upstreamEnded) {
+          status = 'client_abort';
+        }
         upstream.destroy();
       };
       res.on('close', onClose);
@@ -376,13 +531,37 @@ export class AiService {
             res.write(`${block}\n\n`);
           }
           switch (parsed.event) {
-            case EV.TEXT_DELTA:
-              text += asRecord(parsed.json)?.text ?? '';
+            case EV.TEXT_DELTA: {
+              const delta = asRecord(parsed.json)?.text ?? '';
+              if (delta && firstTokenMs === null) {
+                firstTokenMs = Date.now() - startedAt;
+              }
+              text += delta;
               break;
+            }
             case EV.TOOL_RESULT: {
-              const list = asRecord(parsed.json)?.subjects;
+              const rec = asRecord(parsed.json);
+              const list = rec?.subjects;
               if (Array.isArray(list)) {
                 subjects = subjects.concat(list);
+              }
+              const name = rec?.name;
+              if (typeof name === 'string' && name) {
+                toolCalls += 1;
+                toolNames.add(name);
+              }
+              break;
+            }
+            case EV.ERROR:
+              status = 'error';
+              break;
+            case EV.DONE: {
+              const d = asRecord(parsed.json);
+              if (typeof d?.finishReason === 'string') {
+                finishReason = d.finishReason;
+              }
+              if (typeof d?.model === 'string') {
+                model = d.model;
               }
               break;
             }
@@ -399,6 +578,7 @@ export class AiService {
       });
 
       upstream.on('end', () => {
+        upstreamEnded = true;
         void (async () => {
           await finalize();
           res.off('close', onClose);
@@ -470,6 +650,8 @@ function parseSseBlock(block: string): ParsedSse | null {
   }
   return { event, data, json };
 }
+
+/** 统计天数收敛到 1–90，避免把任意整数拼进 SQL 的 INTERVAL */
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object'

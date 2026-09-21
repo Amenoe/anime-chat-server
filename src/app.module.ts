@@ -12,6 +12,7 @@ import { PlaybackModule } from './playback/playback.module';
 import { MediaSourceModule } from './media-source/media-source.module';
 import { RoomModule } from './room/room.module';
 import { AiModule } from './ai/ai.module';
+import { TrackModule } from './track/track.module';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { AiModule } from './ai/ai.module';
     PlaybackModule,
     RoomModule,
     AiModule,
+    TrackModule,
   ],
 })
 export class AppModule {}
