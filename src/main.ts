@@ -30,6 +30,10 @@ async function bootstrap() {
   app.useGlobalFilters(new HttpExceptionFilter());
   app.useGlobalInterceptors(new TransformInterceptor());
   app.enableCors();
-  await app.listen(3000);
+  // 读 PORT/HOST 而不是写死 3000：.env.* 里一直声明着这两个变量却从未被使用，
+  // 导致想换个端口跑（多实例、并行验证）只能改代码。
+  const port = Number(process.env.PORT || 3000);
+  const host = process.env.HOST || '0.0.0.0';
+  await app.listen(port, host);
 }
 bootstrap();

@@ -65,6 +65,28 @@ JWT 双 token 配置：`JWT_SECRET`（access）、`JWT_REFRESH_SECRET`（缺省�
 | `media-source` | 用户订阅的 Animeko 格式数据源（只存 URL，解析在浏览器）                |
 | `storage`      | MinIO（头像）+ 图片代理 controller；`@Global()` 模块                   |
 
+## 埋点（`src/track/`，`@Global()`）
+
+所有事件（前端行为 + 后端业务）都写进**同一张 `track_event` 表**，走 `TrackService` 这一条路径。
+
+- `POST /api/track` —— 前端批量上报，**匿名可用**（`OptionalJwtGuard`）。
+  未登录时靠 body 里的 `anonymousId` 归属，否则拿不到「访客在哪一步流失」。
+- 后端事件直接注入 `TrackService` 调 `trackOne('ai.chat', { userId, props })`。
+- **`TrackService.track()` 吞掉所有异常**：埋点写不进去不该让用户的业务请求失败。
+- `props` 是 JSON，所以加埋点字段不用改表；代价是聚合要 `JSON_EXTRACT`。
+  量级上来后应另建**物化汇总表**（参考 `ai_usage` 的思路），**不要**给通用表加业务专用列。
+- 统计接口（`/api/track/stats/*`、`/api/ai/stats/*`）只给 `role = 'root'`。
+
+⚠️ 两条踩过的坑：
+
+1. **统计接口必须挂 `AuthGuard('jwt')`**。没有守卫时 `req.user` 恒为 `undefined`，
+   连管理员都会被 `assertRoot` 判成 403。
+2. **`props->>'$.x'` 取出来是字符串**，参与算术必须 `CAST(... AS UNSIGNED)`；
+   否则 `+` 会做字符串拼接，`SUM` 出来的结果毫无意义（曾因此 500）。
+   而外层为了「返回给前端是数字」再包一层 `CAST` 是**无效**的 —— TypeORM 的 mysql 驱动
+   开了 `bigNumberStrings`，COUNT/SUM 回来仍是字符串。返回值类型统一用
+   `core/utils/sql.ts` 的 `toNumbers()` / `rowToNumbers()` 在应用层收敛。
+
 ## Auth（改这里前先读 `docs/api-contract.md`）
 
 - 业务接口一律 `@UseGuards(AuthGuard('jwt'))`（**没有全局守卫**，新 controller 必须自己加）

@@ -21,6 +21,15 @@
 | `MINIO_*`                | 头像对象存储                                                                                     |
 | `QB_*`                   | qBittorrent（BT 边下边播）                                                                       |
 | `OUTBOUND_PROXY`         | **可选**。搜源在浏览器完成，服务器通常不需要；仅运维代拉时配置                                   |
+| `AI_SERVICE_URL`         | **可选**。anime-ai 服务地址，默认 `http://127.0.0.1:8013`                                        |
+| `AI_INTERNAL_TOKEN`      | 与 anime-ai 的 `ai.internal-token` **必须一致**，否则转发被拒 401；留空则两侧都不校验（仅本地）  |
+| `AI_DAILY_QUOTA`         | **可选**。每日每人对话次数上限，默认 `50`；`<=0` 表示不限量（仅本地调试）                        |
+| `AI_HISTORY_WINDOW`      | **可选**。每次送给模型的最近消息条数，默认 `20`。**这是唯一的历史裁剪点**（anime-ai 无状态）      |
+| `AI_MAX_MESSAGE_LENGTH`  | **可选**。单条消息长度上限，默认 `2000`                                                          |
+| `AI_UPSTREAM_TIMEOUT_MS` | **可选**。转发建连/首字节超时，默认 `30000`                                                      |
+| `AI_STREAM_TIMEOUT_MS`   | **可选**。单次流式总时限，默认 `180000`；需大于 anime-ai 侧模型超时（60s）                       |
+
+> `PORT` / `HOST` 会覆盖监听地址（默认 `3000` / `0.0.0.0`），便于并行起多实例验证。
 
 ## 鉴权（双 token）
 
