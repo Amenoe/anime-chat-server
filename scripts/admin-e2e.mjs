@@ -100,22 +100,43 @@ function sql(query) {
   return execFileSync('mysql', args, { encoding: 'utf8' }).trim();
 }
 
+/**
+ * 级联表孤儿行总数（8 张表）。
+ *
+ * 放在模块作用域是因为**兜底清理**（`main().catch()`）也要用它 ——
+ * 定义在 main 里会 ReferenceError。`track_event` 不算在内：它**有意保留**。
+ */
+function orphanCount() {
+  return Number(
+    sql(
+      `SELECT (SELECT COUNT(*) FROM ai_message WHERE user_id NOT IN (SELECT user_id FROM \`user\`))
+            + (SELECT COUNT(*) FROM ai_conversation WHERE user_id NOT IN (SELECT user_id FROM \`user\`))
+            + (SELECT COUNT(*) FROM ai_usage WHERE user_id NOT IN (SELECT user_id FROM \`user\`))
+            + (SELECT COUNT(*) FROM user_anime WHERE user_id NOT IN (SELECT user_id FROM \`user\`))
+            + (SELECT COUNT(*) FROM media_source WHERE user_id NOT IN (SELECT user_id FROM \`user\`))
+            + (SELECT COUNT(*) FROM refresh_token WHERE user_id NOT IN (SELECT user_id FROM \`user\`))
+            + (SELECT COUNT(*) FROM group_user_map WHERE user_id NOT IN (SELECT user_id FROM \`user\`))
+            + (SELECT COUNT(*) FROM playback_session WHERE user_id NOT IN (SELECT user_id FROM \`user\`))`,
+    ),
+  );
+}
+
 const main = async () => {
   console.log(`\n== 目标 ${BASE} · 测试账号 ${ADMIN_USER} / ${VICTIM_USER} ==`);
 
   /*
    * 孤儿行基线。
    *
-   * ⚠️ 不能断言「全局零孤儿」—— 这是**共享的开发库**，别人（其它脚本、并行 agent）
-   * 跑完留下的孤儿行会让本脚本无辜失败。实测遇到过：前端验证脚本删账号时
-   * 留下 page.view 孤儿（因为 `track_event` 是有意保留的），本脚本就报了失败。
-   * 所以只断言「**本次运行没有新增**孤儿」，那才是本脚本该负责的不变量。
+   * ⚠️ 两条设计要点，都是踩出来的：
+   *
+   * 1. **不能断言「全局零孤儿」** —— 这是**共享的开发库**，别人（其它脚本、并行 agent）
+   *    跑完留下的孤儿行会让本脚本无辜失败。所以只断言「**本次运行没有新增**孤儿」。
+   * 2. **必须查全部级联表，不能只查 `track_event`** —— 早期版本只统计埋点孤儿，
+   *    结果脚本自己在崩溃时把造出来的 `ai_conversation`/`ai_message` 留成了孤儿，
+   *    而断言照样通过（「无孤儿」是空的）。`track_event` 是**有意保留**的，
+   *    单独统计只作提示；下面这 8 张表是 `AccountCleanupService` 该清的，必须严格为 0 增量。
    */
-  const orphansBefore = Number(
-    sql(
-      'SELECT COUNT(*) FROM track_event WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT user_id FROM `user`)',
-    ),
-  );
+  const orphansBefore = orphanCount();
 
   // ── 建号 + 提权 ────────────────────────────────────────────
   for (const [u, nick] of [
@@ -625,20 +646,24 @@ const main = async () => {
     `SELECT COUNT(*) FROM track_event WHERE user_id='${victimId}' OR user_id IN (SELECT user_id FROM \`user\` WHERE username='${ADMIN_USER}')`,
   );
   check('自己造的埋点行已清干净', mine === '0', `残留 ${mine}`);
-  // 再断言「没有新增孤儿」—— 基线之差，不受共享库里别人的残留影响
-  const orphansAfter = Number(
+  // 核心断言：**全套级联表**的孤儿增量为 0。
+  // 早期版本只统计 track_event，于是脚本自己在崩溃时留下的 ai_conversation/ai_message
+  // 孤儿抓不到（「无孤儿」是空的）—— 这正是本次要修的。
+  const orphansAfter = orphanCount();
+  check(
+    '本次运行未新增孤儿行（8 张级联表）',
+    orphansAfter <= orphansBefore,
+    `基线 ${orphansBefore} → 现在 ${orphansAfter}`,
+  );
+  const trackOrphans = Number(
     sql(
       'SELECT COUNT(*) FROM track_event WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT user_id FROM `user`)',
     ),
   );
-  check(
-    '本次运行未新增孤儿埋点行',
-    orphansAfter <= orphansBefore,
-    `基线 ${orphansBefore} → 现在 ${orphansAfter}`,
-  );
-  if (orphansAfter > 0) {
+  if (orphansAfter > 0 || trackOrphans > 0) {
     console.log(
-      `    （提示：库里另有 ${orphansAfter} 行历史孤儿埋点，非本次产生 —— 别人跑完没清）`,
+      `    （提示：库里另有历史孤儿 ${orphansAfter} 行（级联表）+ ${trackOrphans} 行（埋点，` +
+        `埋点系有意保留），非本次产生）`,
     );
   }
 
@@ -657,6 +682,20 @@ main().catch((e) => {
   const inList = ids.map((i) => `'${i}'`).join(',');
   try {
     if (inList) {
+      /*
+       * ⚠️ 这里必须覆盖**脚本自己造数的每一张表**，不只是 track_event。
+       * 早期版本漏了 ai_conversation / ai_message / ai_usage / user_anime，
+       * 于是崩在半路时这些行留成了孤儿 —— 而脚本的核心断言正是「无孤儿」。
+       * 正常路径靠 API 删号（走 AccountCleanupService 级联）不会漏，
+       * 但崩溃路径只能靠这里兜。
+       */
+      sql(`DELETE FROM ai_message WHERE user_id IN (${inList})`);
+      sql(`DELETE FROM ai_conversation WHERE user_id IN (${inList})`);
+      sql(`DELETE FROM ai_usage WHERE user_id IN (${inList})`);
+      sql(`DELETE FROM user_anime WHERE user_id IN (${inList})`);
+      sql(`DELETE FROM media_source WHERE user_id IN (${inList})`);
+      sql(`DELETE FROM playback_session WHERE user_id IN (${inList})`);
+      sql(`DELETE FROM group_user_map WHERE user_id IN (${inList})`);
       sql(`DELETE FROM track_event WHERE user_id IN (${inList})`);
       sql(`DELETE FROM admin_audit_log WHERE target_id IN (${inList})`);
       sql(`DELETE FROM refresh_token WHERE user_id IN (${inList})`);
@@ -667,10 +706,8 @@ main().catch((e) => {
     sql(
       `DELETE FROM \`user\` WHERE username IN ('${ADMIN_USER}','${VICTIM_USER}')`,
     );
-    const left = sql(
-      'SELECT COUNT(*) FROM track_event WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT user_id FROM `user`)',
-    );
-    console.error(`（兜底清理完成；残留孤儿埋点行 ${left}）`);
+    const left = orphanCount();
+    console.error(`（兜底清理完成；残留级联表孤儿行 ${left}）`);
   } catch {
     /* 清理本身失败就无能为力了，至少把原始异常暴露出来 */
   }
