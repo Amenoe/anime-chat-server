@@ -33,6 +33,18 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     if (!existUser) {
       throw new UnauthorizedException('token不正确');
     }
+    /*
+     * 封禁在这里拦截 —— 这是「封禁即时生效」能低成本成立的关键。
+     * 本方法**本来就每个请求查一次库**，所以在同一次查询上多判一个字段是免费的，
+     * 不需要引入 accessToken 黑名单、也不需要为「可吊销」把 accessToken 落库。
+     */
+    if (existUser.disabled_at != null) {
+      throw new UnauthorizedException(
+        existUser.disabled_reason
+          ? `账号已被禁用：${existUser.disabled_reason}`
+          : '账号已被禁用',
+      );
+    }
     return existUser;
   }
 }
