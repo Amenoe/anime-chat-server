@@ -87,6 +87,13 @@ export class AiController {
     return this.aiService.statsTools(Number(days) || 14);
   }
 
+  /** 访问量 / 消耗 / 使用率（含 AI vs 手动搜索对比） */
+  @Get('stats/engagement')
+  statsEngagement(@Req() req, @Query('days') days?: string) {
+    assertRoot(req);
+    return this.aiService.statsEngagement(Number(days) || 14);
+  }
+
   /** 用量最高的用户 */
   @Get('stats/top-users')
   statsTopUsers(

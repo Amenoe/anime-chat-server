@@ -76,6 +76,11 @@ JWT 双 token 配置：`JWT_SECRET`（access）、`JWT_REFRESH_SECRET`（缺省�
 - `props` 是 JSON，所以加埋点字段不用改表；代价是聚合要 `JSON_EXTRACT`。
   量级上来后应另建**物化汇总表**（参考 `ai_usage` 的思路），**不要**给通用表加业务专用列。
 - 统计接口（`/api/track/stats/*`、`/api/ai/stats/*`）只给 `role = 'root'`。
+- **跨功能口径集中在 `AiService.statsEngagement`**（访问量 / 消耗 / 使用率，
+  含 `ai_rate = AI 对话 ÷ (AI + 手动搜索)`）。它依赖几个**前端**埋点事件名
+  （常量在该文件顶部），改名前端事件名要一起改 ——
+  **查不到事件名不报错，只静默算成 0**，看板上表现为「AI 使用率 100%」这种假象。
+  之所以放后端而不是让前端拼：这是业务定义，散在组件里迟早对不上。
 
 ⚠️ 五条踩过的坑：
 
