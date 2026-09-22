@@ -103,6 +103,20 @@ function sql(query) {
 const main = async () => {
   console.log(`\n== 目标 ${BASE} · 测试账号 ${ADMIN_USER} / ${VICTIM_USER} ==`);
 
+  /*
+   * 孤儿行基线。
+   *
+   * ⚠️ 不能断言「全局零孤儿」—— 这是**共享的开发库**，别人（其它脚本、并行 agent）
+   * 跑完留下的孤儿行会让本脚本无辜失败。实测遇到过：前端验证脚本删账号时
+   * 留下 page.view 孤儿（因为 `track_event` 是有意保留的），本脚本就报了失败。
+   * 所以只断言「**本次运行没有新增**孤儿」，那才是本脚本该负责的不变量。
+   */
+  const orphansBefore = Number(
+    sql(
+      'SELECT COUNT(*) FROM track_event WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT user_id FROM `user`)',
+    ),
+  );
+
   // ── 建号 + 提权 ────────────────────────────────────────────
   for (const [u, nick] of [
     [ADMIN_USER, '管理e2e'],
@@ -566,10 +580,28 @@ const main = async () => {
     `SELECT COUNT(*) FROM \`user\` WHERE username IN ('${ADMIN_USER}','${VICTIM_USER}')`,
   );
   check('测试账号已清理', residual === '0', `残留 ${residual}`);
-  const orphan = sql(
-    `SELECT COUNT(*) FROM track_event WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT user_id FROM \`user\`)`,
+
+  // 先断言「自己造的埋点清干净了」—— 这是本脚本能控制的部分
+  const mine = sql(
+    `SELECT COUNT(*) FROM track_event WHERE user_id='${victimId}' OR user_id IN (SELECT user_id FROM \`user\` WHERE username='${ADMIN_USER}')`,
   );
-  check('未留下孤儿埋点行', orphan === '0', `残留 ${orphan}`);
+  check('自己造的埋点行已清干净', mine === '0', `残留 ${mine}`);
+  // 再断言「没有新增孤儿」—— 基线之差，不受共享库里别人的残留影响
+  const orphansAfter = Number(
+    sql(
+      'SELECT COUNT(*) FROM track_event WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT user_id FROM `user`)',
+    ),
+  );
+  check(
+    '本次运行未新增孤儿埋点行',
+    orphansAfter <= orphansBefore,
+    `基线 ${orphansBefore} → 现在 ${orphansAfter}`,
+  );
+  if (orphansAfter > 0) {
+    console.log(
+      `    （提示：库里另有 ${orphansAfter} 行历史孤儿埋点，非本次产生 —— 别人跑完没清）`,
+    );
+  }
 
   console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);
   process.exit(fail === 0 ? 0 : 1);
