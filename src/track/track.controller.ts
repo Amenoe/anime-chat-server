@@ -1,7 +1,6 @@
 import {
   Body,
   Controller,
-  ForbiddenException,
   Get,
   Post,
   Query,
@@ -10,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { OptionalJwtGuard } from 'src/auth/optional-jwt.guard';
+import { RootGuard } from 'src/auth/root.guard';
 import { TrackBatchDto } from './dto/track.dto';
 import { TrackService } from './track.service';
 
@@ -45,24 +45,18 @@ export class TrackController {
   }
 
   // ── 统计（仅管理员）────────────────────────────────────────
-  // 必须挂 **必需** 的 JWT 守卫：没有守卫时 req.user 恒为 undefined，
-  // 连管理员都会被下面的 assertRoot 判成 403（本开发过程中踩到）。
+  // 两个守卫**缺一不可且顺序不能换**：没有 AuthGuard('jwt') 时 req.user 恒为 undefined，
+  // 连管理员都会被 RootGuard 判成 403（本项目真实踩过两次）。
 
   @Get('stats/overview')
-  @UseGuards(AuthGuard('jwt'))
-  overview(@Req() req, @Query('days') days?: string) {
-    assertRoot(req);
+  @UseGuards(AuthGuard('jwt'), RootGuard)
+  overview(@Query('days') days?: string) {
     return this.trackService.statsOverview(Number(days) || 14);
   }
 
   @Get('stats/top-events')
-  @UseGuards(AuthGuard('jwt'))
-  topEvents(
-    @Req() req,
-    @Query('days') days?: string,
-    @Query('limit') limit?: string,
-  ) {
-    assertRoot(req);
+  @UseGuards(AuthGuard('jwt'), RootGuard)
+  topEvents(@Query('days') days?: string, @Query('limit') limit?: string) {
     return this.trackService.statsTopEvents(
       Number(days) || 14,
       Number(limit) || 30,
@@ -70,16 +64,8 @@ export class TrackController {
   }
 
   @Get('stats/daily')
-  @UseGuards(AuthGuard('jwt'))
-  daily(@Req() req, @Query('days') days?: string) {
-    assertRoot(req);
+  @UseGuards(AuthGuard('jwt'), RootGuard)
+  daily(@Query('days') days?: string) {
     return this.trackService.statsDaily(Number(days) || 14);
-  }
-}
-
-/** 统计是全站聚合数据，没有「本人」一说，直接要求 root */
-function assertRoot(req: { user?: { role?: string } }) {
-  if (req.user?.role !== 'root') {
-    throw new ForbiddenException('仅管理员可查看统计');
   }
 }

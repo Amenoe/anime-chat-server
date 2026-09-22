@@ -22,13 +22,19 @@ const { memoryStorage } = require('multer') as {
 };
 import { AuthGuard } from '@nestjs/passport';
 import { UserService } from './user.service';
+import { AccountCleanupService } from 'src/account/account-cleanup.service';
+import { RefreshTokenService } from 'src/auth/refresh-token.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 
 @Controller('user')
 @UseInterceptors(ClassSerializerInterceptor)
 export class UserController {
-  constructor(private readonly userService: UserService) {}
+  constructor(
+    private readonly userService: UserService,
+    private readonly accountCleanup: AccountCleanupService,
+    private readonly refreshTokenService: RefreshTokenService,
+  ) {}
 
   /**
    * 注册接口
@@ -71,11 +77,11 @@ export class UserController {
     return this.userService.uploadAvatar(req.user.user_id, file);
   }
 
-  @UseGuards(AuthGuard('jwt'))
-  @Get()
-  findAll() {
-    return this.userService.findAll();
-  }
+  // 这里原本有一个 `GET /api/user`（列出全表用户），已删除：
+  // 它只要求「登录」而不要求 root，等于任何注册用户都能枚举全站账号
+  // （含 username / nickname / role —— 连谁是管理员都暴露了），
+  // 而前端全仓从未调用过它。管理端需要列表时走 `GET /api/admin/users`
+  // （分页 + 关键词 + 字段白名单），不要在这里复活一个无分页的全量接口。
 
   /**
    * 修改用户在线状态（路由须在 :id 之前）
@@ -116,14 +122,25 @@ export class UserController {
   }
 
   /**
-   * 通过 id 删除用户
+   * 删除账号。
+   *
+   * 直接调 `AccountCleanupService.purge` 而**不是** `UserService.delete` ——
+   * 后者原本只删 `user` 一行，留下 8 张表的孤儿数据。现在没有那个方法了：
+   * 删号只有「级联清理」一种实现，两个入口（这里 + `AdminUserService.remove`）都调它，
+   * 不存在「有个人调了那个裸删方法」的可能。
    */
   @UseGuards(AuthGuard('jwt'))
   @Delete(':id')
-  delete(@Req() req, @Param('id') id: string) {
+  async delete(@Req() req, @Param('id') id: string) {
+    // 保持既有语义「本人或 root」不变 —— 本次只修孤儿数据，
+    // 不顺带收紧权限（`DELETE /api/admin/users/:id` 是管理端的独立入口）
     if (id !== req.user.user_id && req.user.role !== 'root') {
       throw new ForbiddenException('只能删除自己的账号');
     }
-    return this.userService.delete(id);
+    await this.accountCleanup.purge(id);
+    // purge 已硬删 refresh_token；这里再吊销一次覆盖「purge 之后、响应之前」
+    // 可能刚签发出来的会话（幂等，代价极低）
+    await this.refreshTokenService.revokeAllForUser(id);
+    return { deleted: true };
   }
 }

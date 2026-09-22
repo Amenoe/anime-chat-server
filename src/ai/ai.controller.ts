@@ -2,7 +2,6 @@ import {
   Body,
   Controller,
   Delete,
-  ForbiddenException,
   Get,
   Param,
   Post,
@@ -13,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import type { Response } from 'express';
+import { RootGuard } from 'src/auth/root.guard';
 import { AiService } from './ai.service';
 import { ChatDto } from './dto/chat.dto';
 
@@ -64,59 +64,44 @@ export class AiController {
   }
 
   // ── 用量统计（**仅管理员**）────────────────────────────────
-  // 数据由 ai_request_log 提供；管理员界面是后续工作，这里先把数据通道开出来。
+  // 两个守卫缺一不可：没有 AuthGuard('jwt') 时 req.user 恒为 undefined，
+  // 连管理员都会被 RootGuard 判成 403。统计面向全站聚合，没有「本人」一说。
 
   /** 总览：请求数、成功率、token、延迟、独立用户数 */
   @Get('stats/overview')
-  statsOverview(@Req() req) {
-    assertRoot(req);
+  @UseGuards(AuthGuard('jwt'), RootGuard)
+  statsOverview() {
     return this.aiService.statsOverview();
   }
 
   /** 按天趋势 */
   @Get('stats/daily')
-  statsDaily(@Req() req, @Query('days') days?: string) {
-    assertRoot(req);
+  @UseGuards(AuthGuard('jwt'), RootGuard)
+  statsDaily(@Query('days') days?: string) {
     return this.aiService.statsDaily(Number(days) || 14);
   }
 
   /** 工具使用分布 */
   @Get('stats/tools')
-  statsTools(@Req() req, @Query('days') days?: string) {
-    assertRoot(req);
+  @UseGuards(AuthGuard('jwt'), RootGuard)
+  statsTools(@Query('days') days?: string) {
     return this.aiService.statsTools(Number(days) || 14);
   }
 
   /** 访问量 / 消耗 / 使用率（含 AI vs 手动搜索对比） */
   @Get('stats/engagement')
-  statsEngagement(@Req() req, @Query('days') days?: string) {
-    assertRoot(req);
+  @UseGuards(AuthGuard('jwt'), RootGuard)
+  statsEngagement(@Query('days') days?: string) {
     return this.aiService.statsEngagement(Number(days) || 14);
   }
 
   /** 用量最高的用户 */
   @Get('stats/top-users')
-  statsTopUsers(
-    @Req() req,
-    @Query('days') days?: string,
-    @Query('limit') limit?: string,
-  ) {
-    assertRoot(req);
+  @UseGuards(AuthGuard('jwt'), RootGuard)
+  statsTopUsers(@Query('days') days?: string, @Query('limit') limit?: string) {
     return this.aiService.statsTopUsers(
       Number(days) || 14,
       Number(limit) || 20,
     );
-  }
-}
-
-/**
- * 统计接口只给 `role = 'root'`。
- *
- * 与 `user.controller.ts` 里「本人或 root」的判定不同：这里没有「本人」这一说，
- * 全都是全站聚合数据，所以直接拒绝非 root。
- */
-function assertRoot(req: { user?: { role?: string } }) {
-  if (req.user?.role !== 'root') {
-    throw new ForbiddenException('仅管理员可查看统计');
   }
 }

@@ -40,6 +40,14 @@ export class AuthService {
    * 本地身份策略登录：签发 accessToken(短时) + refreshToken(长时，落库可吊销)
    */
   async login(user: User, userAgent = ''): Promise<AuthSession> {
+    /*
+     * 封禁必须在**签发 token 之前**拦。
+     * 只在 JwtStrategy 拦的话，被封的人会「登录成功但每个请求都 401」——
+     * 界面拿到一个 token 却处处失败，用户完全无从理解发生了什么。
+     * 这里拒绝，前端能直接展示「账号已被禁用」。
+     */
+    this.assertNotDisabled(user);
+
     await this.userService.updateStatus(user.user_id, { status: 1 });
     const fresh = await this.userService.findOne(user.user_id);
 
@@ -60,11 +68,38 @@ export class AuthService {
       throw new UnauthorizedException('账号不存在或已注销');
     }
 
+    /*
+     * 第三个拦截点。封禁时虽然已经 `revokeAllForUser`，但那是「尽力而为」；
+     * 这里再判一次，才是「被封的账号拿旧 refreshToken 也换不出新 token」的硬保证。
+     * 顺手把该用户剩余会话一起吊销 —— 否则其它设备的 refreshToken 还能继续试。
+     */
+    if (user.disabled_at != null) {
+      await this.refreshTokenService.revokeAllForUser(userId);
+      this.assertNotDisabled(user);
+    }
+
     const issued = await this.refreshTokenService.issue(user, {
       replacesId: recordId,
       userAgent,
     });
     return this.buildSession(user, issued.token, issued.recordId);
+  }
+
+  /**
+   * 封禁判定的**唯一实现**（登录与刷新共用）。
+   *
+   * 抽出来是因为「是不是被封」这个判断散在两处迟早会漂移 ——
+   * 一处漏判就是一个能登进去的口子。判定统一用 `!= null` 而不是真值：
+   * `disabled_at` 是时间戳，语义是「有值即封禁」，写清楚比省两个字符重要。
+   */
+  private assertNotDisabled(user: User): void {
+    if (user.disabled_at != null) {
+      throw new UnauthorizedException(
+        user.disabled_reason
+          ? `账号已被禁用：${user.disabled_reason}`
+          : '账号已被禁用',
+      );
+    }
   }
 
   /** 登出：吊销本次会话的 refreshToken（accessToken 自然过期） */
