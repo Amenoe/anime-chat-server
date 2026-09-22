@@ -320,6 +320,45 @@ const main = async () => {
   );
   check('③ 被封后不能刷新 401', i3.status === 401, `实际 ${i3.status}`);
 
+  /*
+   * ④ 有意保留的缺口：被封用户揣着旧 token 打 `POST /api/track` 会被当成**匿名访客**
+   * 记录，而不是 401。
+   *
+   * 这不是 bug，是刻意的取舍：埋点必须对「token 过期的访客」也保持匿名可用
+   * （`OptionalJwtGuard` 丢弃 err 返回 null，见 CLAUDE.md 的埋点约定）——
+   * 改成 401 会误伤正常访客。业务接口全走必需的 `AuthGuard('jwt')`，已被前面三条拦住。
+   *
+   * 把这条**刻意行为**写成断言，是为了防止后人把它当 bug「修」成 401 ——
+   * 那时这里会失败，而失败信息就解释了为什么不该改。
+   */
+  const bannedTrack = await call('POST', '/track', {
+    token: victimTok,
+    body: {
+      events: [
+        {
+          event: 'e2e.banned.anon',
+          page: 'Home',
+          props: { probe: 1 },
+          anonymousId: `e2e-banned-${TAG}`,
+        },
+      ],
+    },
+  });
+  check(
+    '④ 被封后埋点仍匿名可用（200 而非 401，刻意保留）',
+    bannedTrack.status === 200 || bannedTrack.status === 201,
+    `实际 ${bannedTrack.status}`,
+  );
+  const anonRow = sql(
+    `SELECT CONCAT(IFNULL(user_id,'NULL'),'/',anonymous_id) FROM track_event WHERE event='e2e.banned.anon' ORDER BY id DESC LIMIT 1`,
+  );
+  check(
+    '④ 该埋点落在匿名身份上（user_id 为空）',
+    anonRow.startsWith('NULL/'),
+    `实际 ${anonRow}`,
+  );
+  sql(`DELETE FROM track_event WHERE event='e2e.banned.anon'`);
+
   // 自锁防护
   const selfBan = await call('PATCH', `/admin/users/${adminId}/ban`, {
     token: adminTok,
