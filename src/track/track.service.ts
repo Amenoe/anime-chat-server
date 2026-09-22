@@ -101,17 +101,28 @@ export class TrackService {
       : {};
   }
 
-  /** 事件量排行 —— 最直接回答「用户都在干什么」 */
+  /**
+   * 事件量排行 —— 最直接回答「用户都在干什么」。
+   *
+   * 按 **(event, page)** 分组而不是只按 event：`page.view` 这种事件不带页面信息
+   * 就完全没有可读性（「页面访问 40 次」说明不了什么，得知道是哪个页面）。
+   * `page` 列由前端 `setTrackPage` 在每次路由切换时写入，所有事件都有值，
+   * 所以不需要去 props 里掏。
+   *
+   * 代价是排行被拆细了（同一事件在多个页面会占多行），
+   * 因此 limit 给得比纯事件排行宽松些。
+   */
   async statsTopEvents(days = 14, limit = 30) {
     const safeDays = clampDays(days);
     const safeLimit = clampLimit(limit, 30, 100);
     const rows = (await this.repo.query(
       `SELECT event,
+              page,
               COUNT(*)                AS count,
               COUNT(DISTINCT user_id) AS users
        FROM track_event
        WHERE create_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-       GROUP BY event
+       GROUP BY event, page
        ORDER BY count DESC
        LIMIT ?`,
       [safeDays, safeLimit],

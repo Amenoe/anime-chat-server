@@ -39,6 +39,20 @@ export interface ConversationItem {
 /** 一个 AI 对话请求对应的事件名（前后端埋点共用这张表） */
 const EV_AI_CHAT = 'ai.chat';
 
+/**
+ * 前端埋点事件名，用于「AI 使用率」这类**跨功能**指标。
+ *
+ * ⚠️ 与 `anime-chat` 的 `utils/track.ts` 调用处**一一对应**，改名要两端一起改，
+ * 否则指标会静默变成 0（不会报错 —— SQL 里查不到事件名就是 0 行）。
+ */
+const EV_PAGE_VIEW = 'page.view';
+/** AI 回答里的番剧卡片被点开（跳详情页） */
+const EV_AI_CARD_CLICK = 'ai.card.click';
+/** 用户在搜索页提交了一次搜索 */
+const EV_SEARCH_SUBMIT = 'search.submit';
+/** 搜索页的结果被点开（跳详情页），与 AI 卡片点击对称 */
+const EV_SEARCH_RESULT_CLICK = 'search.result.click';
+
 /** 请求终态。client_abort 单列，避免用户中途离开被算成服务错误 */
 type AiEventStatus = 'ok' | 'error' | 'client_abort';
 
@@ -244,6 +258,91 @@ export class AiService {
       [EV_AI_CHAT, safeDays, safeLimit],
     )) as Array<Record<string, unknown>>;
     return toNumbers(rows, ['requests', 'tokens']);
+  }
+
+  /**
+   * AI 助手的**访问量 / 消耗 / 使用率** —— 看板的核心指标。
+   *
+   * 为什么单独一个接口而不是让前端拿 `/stats/tools`、`/stats/daily` 去拼：
+   * 「使用率」是**跨功能**口径（AI 对话次数 vs 手动搜索次数），
+   * 它依赖哪几个事件名、分母怎么取，是一个业务定义，只该有一处。
+   * 散在前端拼装的话，改一次口径要翻好几个组件。
+   *
+   * 口径说明（都是近 N 天、按 `create_time` 过滤）：
+   * - `ai_rate` = AI 对话次数 / (AI 对话次数 + 搜索提交次数)。
+   *   回答的是「用户找番时更倾向 AI 还是搜索」。**不含首页/详情页的浏览行为** ——
+   *   那些是「逛」不是「找」，混进来会让分母失真。
+   * - `card_click_rate` = AI 卡片点击次数 / AI 对话次数。
+   *   一轮对话可能返回多张卡，所以这个比值**可能大于 100%**，它衡量的是
+   *   「一次对话平均被点开几个推荐」，不是「多少比例的对话被点开了」。
+   * - 搜索侧对称地给出 `search_card_click_rate`，两者可直接对比。
+   *
+   * 分母为 0 时一律返回 0（而不是 NaN/null）—— 看板不做特殊分支。
+   */
+  async statsEngagement(days = 14) {
+    const safeDays = clampDays(days);
+
+    const rows = (await this.trackRepo.query(
+      `SELECT event,
+              COUNT(*)                AS count,
+              COUNT(DISTINCT user_id) AS users,
+              COALESCE(SUM(CAST(props->>'$.promptTokens' AS UNSIGNED)), 0)     AS prompt_tokens,
+              COALESCE(SUM(CAST(props->>'$.completionTokens' AS UNSIGNED)), 0) AS completion_tokens
+       FROM track_event
+       WHERE event IN (?, ?, ?, ?)
+         AND create_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       GROUP BY event`,
+      [
+        EV_AI_CHAT,
+        EV_AI_CARD_CLICK,
+        EV_SEARCH_SUBMIT,
+        EV_SEARCH_RESULT_CLICK,
+        safeDays,
+      ],
+    )) as Array<Record<string, unknown>>;
+
+    const [pageRow] = (await this.trackRepo.query(
+      // 按 `page` 列过滤而不是 props：该列由前端 setTrackPage 每次路由切换写入，
+      // 对所有事件都可靠（props 只有 page.view 才带）。
+      `SELECT COUNT(*)                AS pv,
+              COUNT(DISTINCT user_id) AS uv
+       FROM track_event
+       WHERE event = ? AND page = ? AND create_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`,
+      [EV_PAGE_VIEW, 'Ai', safeDays],
+    )) as Array<Record<string, unknown>>;
+
+    const byEvent = new Map(rows.map((r) => [String(r.event), r]));
+    const num = (event: string, key: string): number =>
+      Number(byEvent.get(event)?.[key] ?? 0) || 0;
+
+    const chat = num(EV_AI_CHAT, 'count');
+    const search = num(EV_SEARCH_SUBMIT, 'count');
+    const promptTokens = num(EV_AI_CHAT, 'prompt_tokens');
+    const completionTokens = num(EV_AI_CHAT, 'completion_tokens');
+
+    return {
+      // 访问量
+      page_views: Number(pageRow?.pv ?? 0) || 0,
+      page_users: Number(pageRow?.uv ?? 0) || 0,
+      chat_requests: chat,
+      chat_users: num(EV_AI_CHAT, 'users'),
+      // 消耗
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+      tokens_per_request: chat
+        ? Math.round((promptTokens + completionTokens) / chat)
+        : 0,
+      // 推荐转化
+      card_clicks: num(EV_AI_CARD_CLICK, 'count'),
+      card_click_rate: pct(num(EV_AI_CARD_CLICK, 'count'), chat),
+      // 与手动搜索对比
+      search_count: search,
+      search_users: num(EV_SEARCH_SUBMIT, 'users'),
+      search_card_clicks: num(EV_SEARCH_RESULT_CLICK, 'count'),
+      search_card_click_rate: pct(num(EV_SEARCH_RESULT_CLICK, 'count'), search),
+      ai_rate: pct(chat, chat + search),
+    };
   }
 
   // ── 对话主流程 ──────────────────────────────────────────────
@@ -655,6 +754,16 @@ export class AiService {
 }
 
 // ── 辅助函数 ──────────────────────────────────────────────────
+
+/**
+ * a / b 的百分比，保留一位小数。
+ *
+ * 分母为 0 时返回 **0 而不是 NaN**：看板不做除零分支，
+ * 而 `NaN` 一旦 JSON 化就是 `null`，前端又得兜一层。
+ */
+function pct(a: number, b: number): number {
+  return b > 0 ? Math.round((a / b) * 1000) / 10 : 0;
+}
 
 /** 本地日期 YYYY-MM-DD（按服务器本地时区，与用户感知的「今天」一致） */
 function todayString(): string {
