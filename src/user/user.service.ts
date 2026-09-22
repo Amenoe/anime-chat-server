@@ -68,9 +68,8 @@ export class UserService {
     }
   }
 
-  async findAll() {
-    return await this.userRepository.find();
-  }
+  // findAll() 已删除：它支撑的 `GET /api/user` 是越权枚举接口（详见 user.controller.ts）。
+  // 管理端列表走 `AdminUserService.list()`（分页 + 关键词 + 字段白名单）。
 
   async findOne(id: string) {
     const data = await this.userRepository.findOne({

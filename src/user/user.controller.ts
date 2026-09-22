@@ -71,11 +71,11 @@ export class UserController {
     return this.userService.uploadAvatar(req.user.user_id, file);
   }
 
-  @UseGuards(AuthGuard('jwt'))
-  @Get()
-  findAll() {
-    return this.userService.findAll();
-  }
+  // 这里原本有一个 `GET /api/user`（列出全表用户），已删除：
+  // 它只要求「登录」而不要求 root，等于任何注册用户都能枚举全站账号
+  // （含 username / nickname / role —— 连谁是管理员都暴露了），
+  // 而前端全仓从未调用过它。管理端需要列表时走 `GET /api/admin/users`
+  // （分页 + 关键词 + 字段白名单），不要在这里复活一个无分页的全量接口。
 
   /**
    * 修改用户在线状态（路由须在 :id 之前）
