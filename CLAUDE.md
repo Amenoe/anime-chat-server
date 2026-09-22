@@ -77,7 +77,7 @@ JWT 双 token 配置：`JWT_SECRET`（access）、`JWT_REFRESH_SECRET`（缺省�
   量级上来后应另建**物化汇总表**（参考 `ai_usage` 的思路），**不要**给通用表加业务专用列。
 - 统计接口（`/api/track/stats/*`、`/api/ai/stats/*`）只给 `role = 'root'`。
 
-⚠️ 两条踩过的坑：
+⚠️ 五条踩过的坑：
 
 1. **统计接口必须挂 `AuthGuard('jwt')`**。没有守卫时 `req.user` 恒为 `undefined`，
    连管理员都会被 `assertRoot` 判成 403。
@@ -86,6 +86,17 @@ JWT 双 token 配置：`JWT_SECRET`（access）、`JWT_REFRESH_SECRET`（缺省�
    而外层为了「返回给前端是数字」再包一层 `CAST` 是**无效**的 —— TypeORM 的 mysql 驱动
    开了 `bigNumberStrings`，COUNT/SUM 回来仍是字符串。返回值类型统一用
    `core/utils/sql.ts` 的 `toNumbers()` / `rowToNumbers()` 在应用层收敛。
+3. **每个 `SUM` 都要 `COALESCE(..., 0)`**。零行时 `SUM` 返回 **NULL** 而不是 0
+   （`COUNT` 才天然是 0），而 `toNumbers()` 是**故意跳过 null** 的 ——
+   它只做「字符串→数字」，不补默认值。漏包的结果是接口把 `null` 漏给前端，
+   与「字段都是数字」的契约不符（看板做出 `null` 时实测到的）。
+4. **`props` 里存数组的字段（如 `toolNames`）取出来带 JSON 语法**。
+   `props->>'$.toolNames'` 是 `["browse_anime"]`，多元素时 MySQL 还会加空格
+   （`["a", "b"]`），**不是**逗号分隔的裸名字。要分组就先用 `REPLACE` 剥掉方括号引号。
+   别为了方便改写成拍平的字符串 —— 数组才能支持 `JSON_CONTAINS` 这类查询。
+5. 统计接口的数值**只保证是数字，不保证有值以外的语义**：`user_id` 可为空（匿名埋点）、
+   用户可能已注销，所以 `LEFT JOIN user` 取 `username` 时要接受 `NULL`
+   （**必须 LEFT**：INNER 会把匿名行吞掉，排行总数对不上）。
 
 ## Auth（改这里前先读 `docs/api-contract.md`）
 

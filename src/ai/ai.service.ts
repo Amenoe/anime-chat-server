@@ -116,17 +116,21 @@ export class AiService {
    */
   async statsOverview() {
     const [row] = (await this.trackRepo.query(
-      `SELECT COUNT(*)                                                AS total_requests,
-              SUM(props->>'$.status' = 'ok')                          AS ok_requests,
-              SUM(props->>'$.status' = 'error')                       AS error_requests,
-              SUM(props->>'$.status' = 'client_abort')                AS aborted_requests,
+      // 每个 SUM 都要 COALESCE(...,0)：**零行时 SUM 返回 NULL 而不是 0**。
+      // `toNumbers()` 是故意跳过 null 的（它只负责「字符串→数字」，不负责补默认值），
+      // 漏包的话看板会拿到 null，与接口契约说的「数字」不符（本开发过程中实测到）。
+      // COUNT 天然返回 0，不需要包。
+      `SELECT COUNT(*)                                                       AS total_requests,
+              COALESCE(SUM(props->>'$.status' = 'ok'), 0)                    AS ok_requests,
+              COALESCE(SUM(props->>'$.status' = 'error'), 0)                 AS error_requests,
+              COALESCE(SUM(props->>'$.status' = 'client_abort'), 0)          AS aborted_requests,
               COALESCE(SUM(CAST(props->>'$.promptTokens' AS UNSIGNED)), 0)     AS prompt_tokens,
               COALESCE(SUM(CAST(props->>'$.completionTokens' AS UNSIGNED)), 0) AS completion_tokens,
               COALESCE(SUM(CAST(props->>'$.toolCalls' AS UNSIGNED)), 0)        AS tool_calls,
               COUNT(DISTINCT user_id)                                 AS users,
               COALESCE(ROUND(AVG(CAST(props->>'$.latencyMs' AS UNSIGNED))), 0)    AS avg_latency_ms,
               COALESCE(ROUND(AVG(CAST(props->>'$.firstTokenMs' AS UNSIGNED))), 0) AS avg_first_token_ms,
-              SUM(create_time >= CURDATE())                           AS today_requests
+              COALESCE(SUM(create_time >= CURDATE()), 0)               AS today_requests
        FROM track_event
        WHERE event = ?`,
       [EV_AI_CHAT],
@@ -180,14 +184,25 @@ export class AiService {
   /**
    * 工具使用分布。
    *
-   * 按「组合」分组（`browse_anime` 与 `browse_anime,search_anime` 各算一组），
+   * 按「组合」分组（`browse_anime` 与 `browse_anime, search_anime` 各算一组），
    * 而不是拆成单个工具 —— MySQL 没有内置字符串拆分，为此拉全表到应用层聚合不划算。
    * 组合视角本身也有信息量：能看出模型是否倾向一轮连调多个工具。
+   *
+   * ⚠️ `toolNames` 落库时是**JSON 数组**（`toolNames: [...toolNames]`，见 `finalize`），
+   * 所以 `props->>'$.toolNames'` 取出来是 `["browse_anime", "search_anime"]`
+   * 这种带方括号和引号的文本，**不是**逗号分隔的裸名字。
+   * 早先这里直接拿它分组，看板上工具名显示成了 `["browse_anime"]`（本开发过程中实测到）。
+   * 用 REPLACE 剥掉 JSON 语法即可；多层 REPLACE 比 JSON_TABLE + 聚合简单得多，
+   * 而工具名是固定标识符、不含方括号引号，不存在误伤。
+   * 保留数组写法是**故意的**：结构化的值将来能用 `JSON_CONTAINS` 做「谁调用过某工具」这类查询，
+   * 拍平成字符串就再也查不了了 —— 所以修的是读侧而不是写侧。
    */
   async statsTools(days = 14) {
     const safeDays = clampDays(days);
     const rows = (await this.trackRepo.query(
-      `SELECT COALESCE(NULLIF(props->>'$.toolNames', '[]'), '(无工具)') AS tools,
+      `SELECT COALESCE(NULLIF(
+                REPLACE(REPLACE(REPLACE(props->>'$.toolNames', '[', ''), ']', ''), '"', ''),
+              ''), '(无工具)')                                        AS tools,
               COUNT(*)                                                  AS requests,
               COALESCE(SUM(CAST(props->>'$.toolCalls' AS UNSIGNED)), 0)  AS calls
        FROM track_event
@@ -200,20 +215,30 @@ export class AiService {
     return toNumbers(rows, ['requests', 'calls']);
   }
 
-  /** 用量最高的用户，便于发现异常账号 */
+  /**
+   * 用量最高的用户，便于发现异常账号。
+   *
+   * LEFT JOIN `user` 带出 username/nickname：只给看板一串 UUID 是读不了的，
+   * 而「这个 UUID 是谁」就在隔壁表，没必要让前端再发一轮查询去拼。
+   * 用 LEFT JOIN 而不是 INNER：`user_id` 可为空（匿名埋点），
+   * INNER 会把这些行直接吞掉，排行总数就对不上了。
+   */
   async statsTopUsers(days = 14, limit = 20) {
     const safeDays = clampDays(days);
     const safeLimit = clampLimit(limit, 20, 100);
     const rows = (await this.trackRepo.query(
       // 注意 `+` 两侧都要各自 CAST：`props->>` 取出来是**字符串**，
       // 不 CAST 的话 `+` 会做字符串拼接，SUM 出来的结果毫无意义（本开发过程中踩到 500）。
-      `SELECT user_id,
+      `SELECT t.user_id,
+              u.username,
+              u.nickname,
               COUNT(*) AS requests,
-              COALESCE(SUM(CAST(props->>'$.promptTokens' AS UNSIGNED)
-                         + CAST(props->>'$.completionTokens' AS UNSIGNED)), 0) AS tokens
-       FROM track_event
-       WHERE event = ? AND create_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
-       GROUP BY user_id
+              COALESCE(SUM(CAST(t.props->>'$.promptTokens' AS UNSIGNED)
+                         + CAST(t.props->>'$.completionTokens' AS UNSIGNED)), 0) AS tokens
+       FROM track_event t
+       LEFT JOIN \`user\` u ON u.user_id = t.user_id
+       WHERE t.event = ? AND t.create_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       GROUP BY t.user_id, u.username, u.nickname
        ORDER BY requests DESC
        LIMIT ?`,
       [EV_AI_CHAT, safeDays, safeLimit],

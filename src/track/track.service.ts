@@ -82,10 +82,11 @@ export class TrackService {
   async statsOverview(days = 14) {
     const safeDays = clampDays(days);
     const [row] = (await this.repo.query(
+      // SUM 要 COALESCE(...,0)：零行时 SUM 返回 NULL，不是 0（COUNT 才天然是 0）。
       `SELECT COUNT(*)               AS total_events,
               COUNT(DISTINCT user_id) AS users,
               COUNT(DISTINCT event)   AS event_types,
-              SUM(create_time >= CURDATE()) AS today_events
+              COALESCE(SUM(create_time >= CURDATE()), 0) AS today_events
        FROM track_event
        WHERE create_time >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`,
       [safeDays],
