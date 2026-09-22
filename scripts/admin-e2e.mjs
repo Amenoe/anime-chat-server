@@ -32,6 +32,16 @@ const NEW_PASSWORD = 'reset1234';
 let pass = 0;
 let fail = 0;
 
+/*
+ * 已创建的测试账号 id，**模块级**保存。
+ * 原因：脚本若中途抛异常（历史上就有一次 —— `ai_usage` 主键类型写错，
+ * 崩在清理之前），`main().catch()` 的兜底清理必须还能收拾现场。
+ * 只按用户名删是不够的：那时用户行可能已经不存在，而它名下的埋点行还留着，
+ * 会永久污染开发库（表现为孤儿埋点行）。
+ */
+let adminIdForCleanup = '';
+let victimIdForCleanup = '';
+
 function check(name, ok, extra = '') {
   if (ok) {
     pass++;
@@ -123,6 +133,8 @@ const main = async () => {
   const victimRefresh = victimLogin.data?.refreshToken;
   check('普通用户登录', !!victimTok && !!victimId);
   const adminId = adminLogin.data?.user?.user_id;
+  adminIdForCleanup = adminId ?? '';
+  victimIdForCleanup = victimId ?? '';
 
   // ── 1. 越权：非 root 打管理端 ──────────────────────────────
   console.log('\n-- 1. 越权防护 --');
@@ -422,16 +434,51 @@ const main = async () => {
     token: vTok2,
     body: { events: [{ event: 'e2e.probe', page: 'Home', props: { n: 1 } }] },
   });
-  await call('POST', '/ai/chat', {
-    token: vTok2,
-    body: { message: '推荐几部科幻番' },
-  }).catch(() => undefined); // 上游不可用也无所谓，这里只关心删号
+  /*
+   * AI 数据用 SQL 直接插，**不走 `POST /ai/chat`**。
+   *
+   * 踩过的坑：一开始是调 `POST /ai/chat` 造数据，结果脚本偶发报「留下孤儿埋点行」。
+   * 原因是那条接口是 SSE 流，网关在**流结束时**才写 `ai.chat` 埋点；
+   * 而清理跑在流结束之前 —— 流结束后才落库的那一行就成了孤儿。
+   * 这是**脚本的竞态**，不是产品 bug（`track_event` 本来就有意保留，
+   * 已删用户的行会退化成 LEFT JOIN 能识别的「已注销」），但它让脚本不可重复。
+   * 级联删除只看 `user_id`，数据从哪来无所谓，直接插更快也更确定。
+   */
+  sql(
+    `INSERT INTO ai_conversation (id, user_id, title, create_time, update_time)
+       VALUES (UUID(), '${victimId}', 'e2e 造数', NOW(), NOW())`,
+  );
+  const convId = sql(
+    `SELECT id FROM ai_conversation WHERE user_id='${victimId}' LIMIT 1`,
+  );
+  sql(
+    `INSERT INTO ai_message (id, conversation_id, user_id, role, content, create_time)
+       VALUES (UUID(), '${convId}', '${victimId}', 'user', 'e2e', NOW()),
+              (UUID(), '${convId}', '${victimId}', 'assistant', 'e2e', NOW())`,
+  );
+  // ai_usage.id 是 int AUTO_INCREMENT（与 ai_conversation 的 uuid 主键不同），别传 UUID
+  sql(
+    `INSERT INTO ai_usage (user_id, stat_date, request_count, prompt_tokens, completion_tokens)
+       VALUES ('${victimId}', CURDATE(), 1, 10, 5)`,
+  );
+  sql(
+    `INSERT INTO user_anime (id, user_id, bangumi_id, status, create_time, update_time)
+       VALUES (UUID(), '${victimId}', 10380, 'wish', NOW(), NOW())`,
+  );
   const ownedBefore = sql(
     `SELECT (SELECT COUNT(*) FROM track_event WHERE user_id='${victimId}')
           + (SELECT COUNT(*) FROM refresh_token WHERE user_id='${victimId}')
-          + (SELECT COUNT(*) FROM ai_conversation WHERE user_id='${victimId}')`,
+          + (SELECT COUNT(*) FROM ai_conversation WHERE user_id='${victimId}')
+          + (SELECT COUNT(*) FROM ai_message WHERE user_id='${victimId}')
+          + (SELECT COUNT(*) FROM ai_usage WHERE user_id='${victimId}')
+          + (SELECT COUNT(*) FROM user_anime WHERE user_id='${victimId}')`,
   );
   console.log(`    （删号前 victim 名下可核查数据行数：${ownedBefore}）`);
+  check(
+    '删号前确实造出了多表数据（否则「无孤儿」是空验证）',
+    Number(ownedBefore) >= 6,
+    `实际 ${ownedBefore}`,
+  );
 
   const del = await call('DELETE', `/admin/users/${victimId}`, {
     token: adminTok2,
@@ -530,13 +577,31 @@ const main = async () => {
 
 main().catch((e) => {
   console.error('\n脚本异常（后端是否已启动？mysql 是否可用？）', e.message);
-  // 尽力清理，避免留下测试账号
+  /*
+   * 兜底清理。**不能只删 `user` 行** —— 中途崩溃时用户可能已经被删了，
+   * 而它名下的埋点/审计行还在，会永久污染开发库（孤儿行）。
+   * 用模块级记下的 id 按 id 删，才能覆盖这种情况。
+   */
+  const ids = [adminIdForCleanup, victimIdForCleanup].filter(Boolean);
+  const inList = ids.map((i) => `'${i}'`).join(',');
   try {
+    if (inList) {
+      sql(`DELETE FROM track_event WHERE user_id IN (${inList})`);
+      sql(`DELETE FROM admin_audit_log WHERE target_id IN (${inList})`);
+      sql(`DELETE FROM refresh_token WHERE user_id IN (${inList})`);
+    }
+    sql(
+      `DELETE FROM admin_audit_log WHERE actor_username IN ('${ADMIN_USER}','${VICTIM_USER}')`,
+    );
     sql(
       `DELETE FROM \`user\` WHERE username IN ('${ADMIN_USER}','${VICTIM_USER}')`,
     );
+    const left = sql(
+      'SELECT COUNT(*) FROM track_event WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT user_id FROM `user`)',
+    );
+    console.error(`（兜底清理完成；残留孤儿埋点行 ${left}）`);
   } catch {
-    /* ignore */
+    /* 清理本身失败就无能为力了，至少把原始异常暴露出来 */
   }
   process.exit(1);
 });
