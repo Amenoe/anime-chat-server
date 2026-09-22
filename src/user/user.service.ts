@@ -183,14 +183,4 @@ export class UserService {
     await this.userRepository.update(userId, { avatar });
     return await this.findOne(userId);
   }
-
-  async delete(id: string) {
-    const result = await this.userRepository.delete(id);
-    if (result.affected === 0) {
-      throw new BadRequestException('删除失败');
-    }
-    // 账号已删，其 refreshToken 必须一并作废，避免残留会话
-    await this.refreshTokenService.revokeAllForUser(id);
-    return result;
-  }
 }

@@ -54,16 +54,18 @@ JWT 双 token 配置：`JWT_SECRET`（access）、`JWT_REFRESH_SECRET`（缺省�
 
 | 模块           | 职责                                                                   |
 | -------------- | ---------------------------------------------------------------------- |
-| `auth`         | 登录、双 token 签发/刷新/吊销（`RefreshTokenService`）、Local/JWT 策略 |
+| `auth`         | 登录、双 token 签发/刷新/吊销（`RefreshTokenService`）、Local/JWT 策略、`RootGuard` |
 | `user`         | 用户 CRUD、头像上传（转存 MinIO Private 桶）、在线状态                 |
+| `account`      | `AccountCleanupService`：删号级联清理的**唯一实现**（自删与管理删号共用） |
+| `admin`        | 管理端：用户管理（列表/封禁/改角色/重置密码/删号）+ 审计表             |
 | `user-anime`   | 追番（wish/watching/done），唯一键 `(user_id, bangumi_id)`             |
-| `anime`        | 本地番剧兜底表（Bangumi 迁移后基本不用；`addGroup` 旧路径）            |
 | `group`        | 旧聊天室表 + 放映室共用 `group` 实体；`addGroup` 已标 deprecated       |
 | `room`         | 放映室 HTTP：列房、建房（生成 `season_id`）、按 key 查                 |
 | `chat`         | Socket.IO Gateway：进房、播放强同步、聊天、房主转让                    |
 | `playback`     | 播放会话：流媒体 Range 代理、HLS 改写、BT（qBittorrent）、搜源         |
 | `media-source` | 用户订阅的 Animeko 格式数据源（只存 URL，解析在浏览器）                |
 | `storage`      | MinIO（头像）+ 图片代理 controller；`@Global()` 模块                   |
+| ~~`anime`~~    | **已删除**（2026-09-22）：`/api/anime` 无鉴权且写操作是脚手架桩、表 0 行、前端零调用。`Anime` **实体保留**给 chat 的旧 `addGroup` 路径 |
 
 ## 埋点（`src/track/`，`@Global()`）
 
@@ -85,7 +87,7 @@ JWT 双 token 配置：`JWT_SECRET`（access）、`JWT_REFRESH_SECRET`（缺省�
 ⚠️ 五条踩过的坑：
 
 1. **统计接口必须挂 `AuthGuard('jwt')`**。没有守卫时 `req.user` 恒为 `undefined`，
-   连管理员都会被 `assertRoot` 判成 403。
+   连管理员都会被 `RootGuard` 判成 403。
 2. **`props->>'$.x'` 取出来是字符串**，参与算术必须 `CAST(... AS UNSIGNED)`；
    否则 `+` 会做字符串拼接，`SUM` 出来的结果毫无意义（曾因此 500）。
    而外层为了「返回给前端是数字」再包一层 `CAST` 是**无效**的 —— TypeORM 的 mysql 驱动
@@ -106,6 +108,14 @@ JWT 双 token 配置：`JWT_SECRET`（access）、`JWT_REFRESH_SECRET`（缺省�
 ## Auth（改这里前先读 `docs/api-contract.md`）
 
 - 业务接口一律 `@UseGuards(AuthGuard('jwt'))`（**没有全局守卫**，新 controller 必须自己加）
+- 管理端/统计接口用 `@UseGuards(AuthGuard('jwt'), RootGuard)` —— **两个都挂、顺序不能换**。
+  只挂 `RootGuard` 会因为 `req.user` 恒为 `undefined` 而**连管理员都 403**（本项目踩过两次）。
+  早期是每个 controller 各写一份 `assertRoot`，现统一为 `src/auth/root.guard.ts`
+- **封禁看 `disabled_at`（NULL 即正常），不要用 `status`** —— 后者是**在线状态**。
+  即时失效的判定集中在 `AuthService.assertNotDisabled()`，三个调用点
+  （`JwtStrategy.validate` / `login` / `refresh`）缺一不可，详见 `api-contract.md` §7.2
+- **`role` 绝不能加进 `UpdateUserDto`**：`PATCH /user/:id` 的判定是「本人或 root」，
+  一旦可写，任何登录用户都能提权成 root。该 DTO 上有**编译期断言**守着这条红线，别删
 - `JwtStrategy.validate` 拒绝 `typ === 'refresh'` 的 token → refreshToken 不能访问业务接口
 - accessToken 载荷 `{ user_id, username, typ: 'access', jti }`，不落库，短时效
 - refreshToken 载荷 `{ sub, user_id, username, typ: 'refresh', jti }`，
@@ -156,3 +166,13 @@ BASE=http://127.0.0.1:3000/api node scripts/auth-e2e.mjs
 ```
 
 覆盖登录 → 鉴权 → 刷新轮换 → 复用检测 → 登出 → 改密 → 删号，24 项断言，测试账号自动清理。
+
+管理端（封禁 / 用户管理 / 级联删号 / 审计）也有验收脚本（**改 admin 或封禁逻辑后必须跑**）：
+
+```bash
+node scripts/admin-e2e.mjs
+```
+
+47 项断言。⚠️ 它**需要直连数据库**（从 `.env.development` 读连接）——
+原因有二：「授予 root」没有任何接口（刻意如此），以及「删号不留孤儿」只能查表才能证明。
+它同样自清理，跑完库里不该多出任何行。

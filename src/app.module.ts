@@ -12,6 +12,7 @@ import { MediaSourceModule } from './media-source/media-source.module';
 import { RoomModule } from './room/room.module';
 import { AiModule } from './ai/ai.module';
 import { TrackModule } from './track/track.module';
+import { AdminModule } from './admin/admin.module';
 
 @Module({
   imports: [
@@ -35,6 +36,7 @@ import { TrackModule } from './track/track.module';
     RoomModule,
     AiModule,
     TrackModule,
+    AdminModule,
   ],
 })
 export class AppModule {}
