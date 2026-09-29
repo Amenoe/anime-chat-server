@@ -11,6 +11,8 @@ import { AdminAuditService } from './admin-audit.service';
 import { AdminUserController } from './admin-user.controller';
 import { AdminUserService } from './admin-user.service';
 import { AdminAuditLog } from './entities/admin-audit-log.entity';
+import { AdminReviewController } from './admin-review.controller';
+import { AdminReviewService } from './admin-review.service';
 
 /**
  * 管理端模块。
@@ -34,7 +36,7 @@ import { AdminAuditLog } from './entities/admin-audit-log.entity';
     AuthModule,
     AccountCleanupModule,
   ],
-  controllers: [AdminUserController],
-  providers: [AdminUserService, AdminAuditService],
+  controllers: [AdminUserController, AdminReviewController],
+  providers: [AdminUserService, AdminAuditService, AdminReviewService],
 })
 export class AdminModule {}

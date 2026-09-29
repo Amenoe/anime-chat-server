@@ -346,7 +346,7 @@ const main = async () => {
    * 记录，而不是 401。
    *
    * 这不是 bug，是刻意的取舍：埋点必须对「token 过期的访客」也保持匿名可用
-   * （`OptionalJwtGuard` 丢弃 err 返回 null，见 CLAUDE.md 的埋点约定）——
+   * （`OptionalJwtGuard` 丢弃 err 返回 null，见 AGENTS.md 的埋点约定）——
    * 改成 401 会误伤正常访客。业务接口全走必需的 `AuthGuard('jwt')`，已被前面三条拦住。
    *
    * 把这条**刻意行为**写成断言，是为了防止后人把它当 bug「修」成 401 ——

@@ -24,6 +24,7 @@ import {
 @Entity('track_event')
 @Index(['event', 'create_time'])
 @Index(['user_id', 'create_time'])
+@Index(['create_time'])
 export class TrackEvent {
   @PrimaryGeneratedColumn({ type: 'bigint' })
   id: string;
