@@ -556,13 +556,15 @@ export class AiService {
       const name = (row.name_cn || row.title || '').trim();
       if (!name) continue;
       const bucket = groups[row.status];
-      if (bucket && bucket.length < 8) bucket.push(name);
+      // 带上 bangumi_id：anime-ai 据此去知识库查这部番的题材标签（meta_tags），
+      // 比让模型凭记忆猜「芙莉莲是什么类型」可靠。格式 id:标题，分号分隔。
+      if (bucket && bucket.length < 8) bucket.push(`${row.bangumi_id}:${name}`);
     }
 
     const lines: string[] = [];
-    if (groups.watching.length) lines.push(`【在看】${groups.watching.join('、')}`);
-    if (groups.done.length) lines.push(`【看完】${groups.done.join('、')}`);
-    if (groups.wish.length) lines.push(`【想看】${groups.wish.join('、')}`);
+    if (groups.watching.length) lines.push(`【在看】${groups.watching.join(';')}`);
+    if (groups.done.length) lines.push(`【看完】${groups.done.join(';')}`);
+    if (groups.wish.length) lines.push(`【想看】${groups.wish.join(';')}`);
     return lines.join('\n');
   }
 
