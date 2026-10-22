@@ -27,6 +27,19 @@ export class UserAnimeService {
       if (dto.title !== undefined) row.title = dto.title;
       if (dto.name_cn !== undefined) row.name_cn = dto.name_cn;
       if (dto.cover !== undefined) row.cover = dto.cover;
+    if (dto.total_episodes !== undefined && dto.total_episodes > 0) {
+      row.total_episodes = dto.total_episodes;
+    }
+    // 播放页上报进度用的是 PATCH，允许回退（用户可能重看），所以这里直接赋值
+    if (dto.watched_episode !== undefined) row.watched_episode = dto.watched_episode;
+      // 总集数只在明确给了非零值时才覆盖，避免二次收藏把已知的集数抹成 0
+      if (dto.total_episodes !== undefined && dto.total_episodes > 0) {
+        row.total_episodes = dto.total_episodes;
+      }
+      // 进度取较大值：重新收藏不该把「已经看到第 8 集」退回到 0
+      if (dto.watched_episode !== undefined && dto.watched_episode > row.watched_episode) {
+        row.watched_episode = dto.watched_episode;
+      }
     } else {
       row = this.userAnimeRepo.create({
         user_id: userId,
@@ -35,6 +48,8 @@ export class UserAnimeService {
         title: dto.title ?? null,
         name_cn: dto.name_cn ?? null,
         cover: dto.cover ?? null,
+        watched_episode: dto.watched_episode ?? 0,
+        total_episodes: dto.total_episodes ?? 0,
       });
     }
 
@@ -53,12 +68,21 @@ export class UserAnimeService {
     if (dto.title !== undefined) row.title = dto.title;
     if (dto.name_cn !== undefined) row.name_cn = dto.name_cn;
     if (dto.cover !== undefined) row.cover = dto.cover;
+    if (dto.total_episodes !== undefined && dto.total_episodes > 0) {
+      row.total_episodes = dto.total_episodes;
+    }
+    // 播放页上报进度用的是 PATCH，允许回退（用户可能重看），所以这里直接赋值
+    if (dto.watched_episode !== undefined) row.watched_episode = dto.watched_episode;
 
+    // 注意：这里必须与上面实际赋值的字段**保持同步**，
+    // 否则只传新字段（如播放页只上报 watched_episode）会被误判成「空更新」退回 400。
     if (
       dto.status === undefined &&
       dto.title === undefined &&
       dto.name_cn === undefined &&
-      dto.cover === undefined
+      dto.cover === undefined &&
+      dto.watched_episode === undefined &&
+      dto.total_episodes === undefined
     ) {
       throw new BadRequestException('没有可更新的字段');
     }
