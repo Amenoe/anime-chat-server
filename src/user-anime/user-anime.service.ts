@@ -27,11 +27,6 @@ export class UserAnimeService {
       if (dto.title !== undefined) row.title = dto.title;
       if (dto.name_cn !== undefined) row.name_cn = dto.name_cn;
       if (dto.cover !== undefined) row.cover = dto.cover;
-    if (dto.total_episodes !== undefined && dto.total_episodes > 0) {
-      row.total_episodes = dto.total_episodes;
-    }
-    // 播放页上报进度用的是 PATCH，允许回退（用户可能重看），所以这里直接赋值
-    if (dto.watched_episode !== undefined) row.watched_episode = dto.watched_episode;
       // 总集数只在明确给了非零值时才覆盖，避免二次收藏把已知的集数抹成 0
       if (dto.total_episodes !== undefined && dto.total_episodes > 0) {
         row.total_episodes = dto.total_episodes;
@@ -71,8 +66,11 @@ export class UserAnimeService {
     if (dto.total_episodes !== undefined && dto.total_episodes > 0) {
       row.total_episodes = dto.total_episodes;
     }
-    // 播放页上报进度用的是 PATCH，允许回退（用户可能重看），所以这里直接赋值
-    if (dto.watched_episode !== undefined) row.watched_episode = dto.watched_episode;
+    // **重看不影响进度**：取较大值。
+    // 用户在放映室或播放页重看旧集时，不该把「已经看到第 20 话」退回第 3 话。
+    if (dto.watched_episode !== undefined && dto.watched_episode > row.watched_episode) {
+      row.watched_episode = dto.watched_episode;
+    }
 
     // 注意：这里必须与上面实际赋值的字段**保持同步**，
     // 否则只传新字段（如播放页只上报 watched_episode）会被误判成「空更新」退回 400。
