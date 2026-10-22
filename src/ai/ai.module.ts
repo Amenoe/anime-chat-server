@@ -6,6 +6,7 @@ import { AiConversation } from './entities/ai-conversation.entity';
 import { AiMessage } from './entities/ai-message.entity';
 import { AiUsage } from './entities/ai-usage.entity';
 import { TrackEvent } from 'src/track/entities/track-event.entity';
+import { UserAnime } from 'src/user-anime/entities/user-anime.entity';
 
 /**
  * AI 网关模块：鉴权 + 配额 + 会话落库 + SSE 透传到 anime-ai。
@@ -14,7 +15,14 @@ import { TrackEvent } from 'src/track/entities/track-event.entity';
  */
 @Module({
   imports: [
-    TypeOrmModule.forFeature([AiConversation, AiMessage, AiUsage, TrackEvent]),
+    TypeOrmModule.forFeature([
+      AiConversation,
+      AiMessage,
+      AiUsage,
+      TrackEvent,
+      // 只在转发前查一次用户的追番摘要，不写业务逻辑
+      UserAnime,
+    ]),
   ],
   controllers: [AiController],
   providers: [AiService],

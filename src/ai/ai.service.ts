@@ -25,6 +25,10 @@ import { AiMessage } from './entities/ai-message.entity';
 import { AiUsage } from './entities/ai-usage.entity';
 import { TrackEvent } from 'src/track/entities/track-event.entity';
 import { TrackService } from 'src/track/track.service';
+import {
+  UserAnime,
+  UserAnimeStatus,
+} from 'src/user-anime/entities/user-anime.entity';
 
 /** 会话列表项 */
 export interface ConversationItem {
@@ -84,6 +88,8 @@ export class AiService {
     private readonly usageRepo: Repository<AiUsage>,
     @InjectRepository(TrackEvent)
     private readonly trackRepo: Repository<TrackEvent>,
+    @InjectRepository(UserAnime)
+    private readonly userAnimeRepo: Repository<UserAnime>,
     private readonly trackService: TrackService,
   ) {}
 
@@ -372,10 +378,20 @@ export class AiService {
       { role: 'user' as const, content: dto.message },
     ];
 
+    // 追番摘要：让模型知道这人的口味、以及别重复推荐他已经在看/看完的
+    let userAnime: string;
+    try {
+      userAnime = await this.buildUserAnimeContext(userId);
+    } catch (e) {
+      // 摘要只是增强，查不到不该让整轮对话失败
+      this.logger.warn(`读取追番摘要失败，按无记录处理: ${e instanceof Error ? e.message : e}`);
+      userAnime = '';
+    }
+
     // 先把上游接上再写 SSE 头，否则上游挂了就只能发 error 事件、拿不到真实状态码
     let upstream: { data: Readable };
     try {
-      upstream = await this.openUpstream(existing?.id, messages);
+      upstream = await this.openUpstream(existing?.id, messages, userAnime);
     } catch (e) {
       const msg = e instanceof Error ? e.message : '上游 AI 服务不可用';
       this.logger.error(`连接 anime-ai 失败: ${msg}`);
@@ -514,13 +530,50 @@ export class AiService {
     return rows.reverse();
   }
 
+  /**
+   * 拼一份用户追番摘要，作为系统提示词的上下文。
+   *
+   * 三条取舍：
+   * 1. **只给标题，不给封面/链接**：模型用不上，白占 token。
+   * 2. **分类 + 限条数**（每类最多 8 部、总数 24）：几十上百部会把对话历史挤掉，
+   *    而模型真正需要的只有「口味」和「哪些别重复推荐」。
+   * 3. **查失败不抛**：摘要只是增强，读不到就按「无记录」处理，不能因此让整轮对话失败。
+   */
+  private async buildUserAnimeContext(userId: string): Promise<string> {
+    const rows = await this.userAnimeRepo.find({
+      where: { user_id: userId },
+      order: { update_time: 'DESC' },
+      take: 60,
+    });
+    if (!rows.length) return '';
+
+    const groups: Record<UserAnimeStatus, string[]> = {
+      watching: [],
+      done: [],
+      wish: [],
+    };
+    for (const row of rows) {
+      const name = (row.name_cn || row.title || '').trim();
+      if (!name) continue;
+      const bucket = groups[row.status];
+      if (bucket && bucket.length < 8) bucket.push(name);
+    }
+
+    const lines: string[] = [];
+    if (groups.watching.length) lines.push(`【在看】${groups.watching.join('、')}`);
+    if (groups.done.length) lines.push(`【看完】${groups.done.join('、')}`);
+    if (groups.wish.length) lines.push(`【想看】${groups.wish.join('、')}`);
+    return lines.join('\n');
+  }
+
   // ── 上游转发 ────────────────────────────────────────────────
 
   private async openUpstream(
     conversationId: string | undefined,
     messages: Array<{ role: string; content: string }>,
+    userAnime: string,
   ): Promise<{ data: Readable }> {
-    const body = { conversationId, messages };
+    const body = { conversationId, messages, userAnime };
     const response = await axios.post(
       `${aiConfig.serviceUrl}/internal/ai/chat`,
       body,
