@@ -130,6 +130,22 @@ export const outboundConfig = {
  * 会话历史的权威来源是这里的 MySQL —— anime-ai 是无状态的，
  * 每次请求由本服务把历史窗口一并送过去。所以 `historyWindow` 是**唯一**的窗口裁剪点。
  */
+/**
+ * 弹幕（dandanplay 开放平台）。
+ *
+ * 签名算法 `base64(sha256(AppId + Timestamp + Path + AppSecret))` 只在服务端执行 ——
+ * AppSecret 泄露等于任何人都能冒用我们的调用配额。
+ *
+ * 未配置时弹幕接口返回空，播放器只是没有弹幕，不影响播放本身。
+ */
+export const danmakuConfig = {
+  appId: (process.env.DANDANPLAY_APP_ID || '').trim(),
+  appSecret: (process.env.DANDANPLAY_APP_SECRET || '').trim(),
+  callback: (process.env.DANDANPLAY_CALLBACK || '').trim(),
+  /** 单集弹幕上限：极端集有上万条，全塞给前端会卡渲染 */
+  maxItems: Number(process.env.DANMAKU_MAX_ITEMS || 6000),
+};
+
 export const aiConfig = {
   serviceUrl: (process.env.AI_SERVICE_URL || 'http://127.0.0.1:8013').replace(
     /\/+$/,

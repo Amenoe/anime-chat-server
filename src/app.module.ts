@@ -11,6 +11,7 @@ import { PlaybackModule } from './playback/playback.module';
 import { MediaSourceModule } from './media-source/media-source.module';
 import { RoomModule } from './room/room.module';
 import { AiModule } from './ai/ai.module';
+import { DanmakuModule } from './danmaku/danmaku.module';
 import { TrackModule } from './track/track.module';
 import { AdminModule } from './admin/admin.module';
 
@@ -37,6 +38,7 @@ import { AdminModule } from './admin/admin.module';
     AiModule,
     TrackModule,
     AdminModule,
+    DanmakuModule,
   ],
 })
 export class AppModule {}
