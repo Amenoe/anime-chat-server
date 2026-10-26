@@ -27,6 +27,10 @@
 | `AI_HISTORY_WINDOW`      | **可选**。每次送给模型的最近消息条数，默认 `20`。**这是唯一的历史裁剪点**（anime-ai 无状态）      |
 | `AI_MAX_MESSAGE_LENGTH`  | **可选**。单条消息长度上限，默认 `2000`                                                          |
 | `AI_UPSTREAM_TIMEOUT_MS` | **可选**。转发建连/首字节超时，默认 `30000`                                                      |
+| `DANDANPLAY_APP_ID`      | 弹幕开放平台的 AppId（[申请](https://doc.dandanplay.com/open/)）                                 |
+| `DANDANPLAY_APP_SECRET`  | 弹幕开放平台的 AppSecret。**只在服务端用**，签名 `base64(sha256(AppId+Timestamp+Path+Secret))`     |
+| `DANDANPLAY_CALLBACK`    | **可选**。OAuth 回调地址；当前只做只读弹幕，未用到登录态                                         |
+| `DANMAKU_MAX_ITEMS`      | **可选**。单集弹幕上限，默认 `6000`；超限按时间**均匀抽样**（截断会让后半集没弹幕）              |
 | `AI_STREAM_TIMEOUT_MS`   | **可选**。单次流式总时限，默认 `180000`；需大于 anime-ai 侧模型超时（60s）                       |
 
 > `PORT` / `HOST` 会覆盖监听地址（默认 `3000` / `0.0.0.0`），便于并行起多实例验证。
