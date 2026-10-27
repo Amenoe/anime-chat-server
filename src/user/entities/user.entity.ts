@@ -50,6 +50,15 @@ export class User {
   disabled_at: Date | null;
 
   /** 封禁原因，展示给被封的人看（避免用户只知道「被封了」而不知道找谁问） */
+  /**
+   * 播放器弹幕偏好（visible / speed / opacity / fontSize / margin / mode / color / antiOverlap）。
+   *
+   * 存 JSON 而不是拆列：这些是**前端播放器的展示偏好**，字段集合会随播放器升级变化，
+   * 拆成列每次调参都要走迁移。它也从不参与查询与统计，没有索引价值。
+   */
+  @Column({ type: 'json', nullable: true })
+  danmaku_settings: Record<string, unknown> | null;
+
   @Column({ type: 'varchar', length: 255, default: '' })
   disabled_reason: string;
 

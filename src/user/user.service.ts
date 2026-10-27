@@ -9,6 +9,7 @@ import { Repository } from 'typeorm';
 import * as bcrypt from 'bcryptjs';
 import { extname } from 'path';
 import { CreateUserDto } from './dto/create-user.dto';
+import { DanmakuSettingsDto } from './dto/danmaku-settings.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { User } from './entities/user.entity';
 import { MinioService } from '../storage/minio.service';
@@ -70,6 +71,36 @@ export class UserService {
 
   // findAll() 已删除：它支撑的 `GET /api/user` 是越权枚举接口（详见 user.controller.ts）。
   // 管理端列表走 `AdminUserService.list()`（分页 + 关键词 + 字段白名单）。
+
+  /**
+   * 读取弹幕偏好。
+   *
+   * 没设置过返回空对象而不是 null：前端拿到 `{}` 就补默认值，
+   * 少一层「null 还是空对象」的分支判断。
+   */
+  async getDanmakuSettings(userId: string) {
+    const user = await this.userRepository.findOne({ where: { user_id: userId } });
+    if (!user) {
+      throw new HttpException('该用户不存在', HttpStatus.BAD_REQUEST);
+    }
+    return user.danmaku_settings ?? {};
+  }
+
+  /**
+   * 合并保存弹幕偏好 —— **只覆盖 dto 里出现的字段**。
+   *
+   * 不用整体替换：用户在 A 设备只调了速度，B 设备调过字号，
+   * 整体替换会让后一次把前一次的设置抹掉。
+   */
+  async updateDanmakuSettings(userId: string, dto: DanmakuSettingsDto) {
+    const user = await this.userRepository.findOne({ where: { user_id: userId } });
+    if (!user) {
+      throw new HttpException('该用户不存在', HttpStatus.BAD_REQUEST);
+    }
+    user.danmaku_settings = { ...(user.danmaku_settings ?? {}), ...dto };
+    await this.userRepository.save(user);
+    return user.danmaku_settings;
+  }
 
   async findOne(id: string) {
     const data = await this.userRepository.findOne({

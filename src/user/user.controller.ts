@@ -22,6 +22,7 @@ const { memoryStorage } = require('multer') as {
 };
 import { AuthGuard } from '@nestjs/passport';
 import { UserService } from './user.service';
+import { DanmakuSettingsDto } from './dto/danmaku-settings.dto';
 import { AccountCleanupService } from 'src/account/account-cleanup.service';
 import { RefreshTokenService } from 'src/auth/refresh-token.service';
 import { CreateUserDto } from './dto/create-user.dto';
@@ -100,6 +101,24 @@ export class UserController {
   }
 
   @UseGuards(AuthGuard('jwt'))
+  /**
+   * 弹幕偏好。
+   *
+   * ⚠️ 这两个路由必须声明在 `@Get(':id')` **之前** —— 否则 "danmaku-settings"
+   * 会被当成 :id 参数，直接 400（ParseIntPipe 之类）或查不到用户。
+   */
+  @UseGuards(AuthGuard('jwt'))
+  @Get('danmaku-settings')
+  getDanmakuSettings(@Req() req) {
+    return this.userService.getDanmakuSettings(req.user.user_id);
+  }
+
+  @UseGuards(AuthGuard('jwt'))
+  @Patch('danmaku-settings')
+  updateDanmakuSettings(@Req() req, @Body() dto: DanmakuSettingsDto) {
+    return this.userService.updateDanmakuSettings(req.user.user_id, dto);
+  }
+
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.userService.findOne(id);
