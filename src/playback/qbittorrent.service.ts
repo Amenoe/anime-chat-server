@@ -19,6 +19,10 @@ export type QbTorrentInfo = {
   state: string;
   save_path: string;
   content_path: string;
+  /** 顺序下载（边下边播依赖它：前面的分片先落地） */
+  seq_dl?: boolean;
+  /** 首尾分片优先，让容器头部尽早可解析 */
+  f_l_piece_prio?: boolean;
 };
 
 export type QbTorrentFile = {
@@ -153,19 +157,47 @@ export class QbittorrentService {
     return res.data as T;
   }
 
-  /** 添加磁力或种子 URL，返回 infohash（尽量从列表匹配） */
+  /**
+   * 添加磁力或种子 URL，返回 infohash。
+   *
+   * 幂等：qB 5.x 对**已存在**的种子返回 409，这里先按 infohash 查列表再决定是否 add，
+   * 并且把 409 当「已存在」继续走；否则同一个磁力第二次播放会直接 503。
+   *
+   * 添加时开 `seq_dl`（顺序下载）与 `f_l_piece_prio`（首尾分片优先）：
+   * 顺序下载让文件从前往后陆续落地，边下边播才真的有东西可读。
+   */
   async addMagnetOrUrl(uri: string): Promise<string> {
+    const hashFromMagnet = this.extractHash(uri);
+
+    if (hashFromMagnet) {
+      const found = await this.findByHash(hashFromMagnet);
+      if (found) return found.hash;
+    }
+
     const form = new FormData();
     form.append('urls', uri);
     form.append('savepath', '/downloads');
     form.append('category', 'anime-chat-playback');
     form.append('paused', 'false');
     form.append('autoTMM', 'false');
+    form.append('seq_dl', 'true');
+    form.append('firstLastPiecePrio', 'true');
 
-    await this.request('post', '/api/v2/torrents/add', form, form.getHeaders());
+    try {
+      await this.request(
+        'post',
+        '/api/v2/torrents/add',
+        form,
+        form.getHeaders(),
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // 409 Conflict = 该种子已在 qB 里，继续走下面的匹配逻辑
+      if (!msg.includes('-> 409')) throw e;
+      this.logger.log(`种子已存在，复用: ${uri.slice(0, 60)}`);
+    }
 
     // 等待出现在列表中
-    const hashFromMagnet = this.extractHash(uri);
     for (let i = 0; i < 15; i++) {
       await this.sleep(1000);
       const list = await this.listTorrents();
@@ -186,11 +218,55 @@ export class QbittorrentService {
     throw new ServiceUnavailableException('添加种子超时，请检查 qBittorrent');
   }
 
+  /** 按 infohash 找种子（不存在返回 null） */
+  async findByHash(hash: string): Promise<QbTorrentInfo | null> {
+    const info = await this.getTorrent(hash);
+    return info;
+  }
+
   extractHash(uri: string): string | null {
     const m = uri.match(/btih:([a-fA-F0-9]{40})/i);
     if (m) return m[1].toLowerCase();
     const m2 = uri.match(/btih:([a-zA-Z2-7]{32})/i); // base32
-    return m2 ? m2[1].toLowerCase() : null;
+    return m2 ? this.base32ToHex(m2[1]) : null;
+  }
+
+  /** qB 的 hash 一律是 40 位十六进制，base32 磁力需要转换才能对上 */
+  private base32ToHex(input: string): string {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    let bits = '';
+    for (const ch of input.toUpperCase()) {
+      const idx = alphabet.indexOf(ch);
+      if (idx < 0) return input.toLowerCase();
+      bits += idx.toString(2).padStart(5, '0');
+    }
+    let hex = '';
+    for (let i = 0; i + 4 <= bits.length; i += 4) {
+      hex += parseInt(bits.slice(i, i + 4), 2).toString(16);
+    }
+    return hex.toLowerCase();
+  }
+
+  /** 设置顺序下载（已经开着就不动，避免 toggle 成关闭） */
+  async setSequential(hash: string, enabled = true): Promise<void> {
+    try {
+      const info = await this.getTorrent(hash);
+      if (!info) return;
+      if (!!info.seq_dl === enabled) return;
+      const body = new URLSearchParams();
+      body.set('hashes', hash);
+      await this.request(
+        'post',
+        '/api/v2/torrents/toggleSequentialDownload',
+        body.toString(),
+        { 'Content-Type': 'application/x-www-form-urlencoded' },
+      );
+    } catch (e) {
+      // 顺序下载只是优化：失败不该让整个播放会话失败
+      this.logger.debug(
+        `设置顺序下载失败: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
 
   async listTorrents(): Promise<QbTorrentInfo[]> {

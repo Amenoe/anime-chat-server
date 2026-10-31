@@ -13,6 +13,7 @@ import {
 } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { Response } from 'express';
+import { createReadStream } from 'fs';
 import { CreatePlaybackDto } from './dto/create-playback.dto';
 import { AutoPlaybackDto } from './dto/auto-playback.dto';
 import { StreamPlaybackDto } from './dto/stream-playback.dto';
@@ -104,6 +105,7 @@ export class PlaybackController {
     @Param('id') id: string,
     @Headers('range') range: string | undefined,
     @Query('token') token: string | undefined,
+    @Query('format') format: string | undefined,
     @Res() res: Response,
   ) {
     try {
@@ -116,14 +118,94 @@ export class PlaybackController {
         id,
         req.user.user_id,
         range,
-        { accessToken },
+        {
+          accessToken,
+          // ?format=fmp4：强制走 ffmpeg（mkv/HEVC），前端在 remuxRequired 时带
+          forceTranscode: format === 'fmp4' || format === 'mp4',
+        },
       );
       await this.pipeStreamResult(res, result);
     } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error('[playback.stream] failed', e);
       const msg = e instanceof Error ? e.message : 'stream error';
       if (e instanceof BadRequestException) throw e;
-      throw new BadRequestException(msg);
+      throw new BadRequestException(msg || '播放失败');
     }
+  }
+
+  /** 当前会话的内嵌字幕轨（供播放器列字幕菜单） */
+  @Get('sessions/:id/subtitles')
+  subtitles(@Req() req, @Param('id') id: string) {
+    return this.playbackService.getSubtitleTracks(id, req.user.user_id);
+  }
+
+  /**
+   * 内嵌字幕转 WebVTT。
+   * `<track>` 无法带 Authorization 头，所以和 stream 一样支持 ?token=。
+   */
+  @Get('sessions/:id/subtitle/:track')
+  async subtitle(
+    @Req() req,
+    @Param('id') id: string,
+    @Param('track') track: string,
+    @Res() res: Response,
+  ) {
+    const n = Number(String(track).replace(/\.vtt$/i, ''));
+    const vtt = await this.playbackService.getSubtitleVtt(
+      id,
+      req.user.user_id,
+      n,
+    );
+    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.send(vtt);
+  }
+
+  /**
+   * mkv/HEVC 的 HLS 播放列表：整条 VOD playlist（全部 EXTINF + ENDLIST），
+   * 播放器因此能显示真实总时长并允许拖动进度。
+   */
+  @Get('sessions/:id/hls.m3u8')
+  async hlsPlaylist(
+    @Req() req,
+    @Param('id') id: string,
+    @Query('token') token: string | undefined,
+    @Res() res: Response,
+  ) {
+    const accessToken =
+      token ||
+      (typeof req.headers.authorization === 'string'
+        ? req.headers.authorization.replace(/^Bearer\s+/i, '')
+        : undefined);
+    const playlist = await this.playbackService.getHlsPlaylist(
+      id,
+      req.user.user_id,
+      accessToken,
+    );
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(playlist);
+  }
+
+  /** 单个 HLS 分片（首次请求触发转码，之后命中缓存） */
+  @Get('sessions/:id/hls/:index')
+  async hlsSegment(
+    @Req() req,
+    @Param('id') id: string,
+    @Param('index') index: string,
+    @Res() res: Response,
+  ) {
+    const n = Number(String(index).replace(/\.ts$/i, ''));
+    const seg = await this.playbackService.getHlsSegment(
+      id,
+      req.user.user_id,
+      n,
+    );
+    res.setHeader('Content-Type', 'video/mp2t');
+    res.setHeader('Content-Length', String(seg.size));
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    createReadStream(seg.path).pipe(res);
   }
 
   /**
@@ -176,8 +258,12 @@ export class PlaybackController {
     const { stream, contentType, size, start, end, partial } = result;
 
     res.setHeader('Content-Type', contentType);
-    res.setHeader('Accept-Ranges', 'bytes');
+    // 转封装流（size=0）是从头生成的 fMP4，不接受 Range，别让浏览器误以为能 seek
+    if (size > 0) res.setHeader('Accept-Ranges', 'bytes');
+    else res.setHeader('Accept-Ranges', 'none');
     res.setHeader('Cache-Control', 'no-store');
+    // 转码/转封装耗时不固定，关掉中间层缓冲，让首帧尽快出来
+    res.setHeader('X-Accel-Buffering', 'no');
 
     if (partial) {
       res.status(206);

@@ -53,8 +53,12 @@ Emoji-prefixed Angular-style commits（与前端仓库一致）:
 ## Configuration
 
 `src/core/config/config.ts` 用 dotenv 按 `NODE_ENV` 加载 `.env.development` / `.env.production`，
-导出 `appConfig` / `jwtConfig` / `DBConifg` / `minioConfig` 等。**`.env*` 一律不提交**
+导出 `appConfig` / `jwtConfig` / `DBConifg` / `minioConfig` / `transcodeConfig` 等。**`.env*` 一律不提交**
 （`.gitignore` 已排除），新增配置必须同时在 README 环境变量表里说明。
+
+播放转封装（可选，缺省即可用）：`FFMPEG_PATH` / `FFPROBE_PATH` / `PLAYBACK_TRANSCODE` /
+`PLAYBACK_VIDEO_ENCODER` / `PLAYBACK_TRANSCODE_MAX_BITRATE`。本机 `ffmpeg` 不在 PATH 时
+mkv/HEVC 会提示换 mp4 源，其余播放不受影响。
 
 JWT 双 token 配置：`JWT_SECRET`（access）、`JWT_REFRESH_SECRET`（缺省由前者派生 `":refresh"`）、
 `JWT_ACCESS_EXPIRES_IN`（默认 `2h`）、`JWT_REFRESH_EXPIRES_IN`（默认 `30d`）。
@@ -153,10 +157,34 @@ JWT 双 token 配置：`JWT_SECRET`（access）、`JWT_REFRESH_SECRET`（缺省�
 ## Playback
 
 - 流媒体：`POST /api/playback/sessions/stream` → Range 代理出流
-- BT：`POST /api/playback/sessions`（magnet）→ qBittorrent 边下边播；`QB_ENABLED=false` 不影响流媒体
+- BT：`POST /api/playback/sessions`（magnet）→ qBittorrent；`QB_ENABLED=false` 不影响流媒体
 - `GET /api/playback/sessions/:id/stream?token=` 额外支持 query token（video/hls 无法带 Header）
 - HLS 相对 URI 改写 + 同源代理 `enc.key` / `.ts`
 - 详见 `docs/playback-architecture.md`
+
+⚠️ 边下边播（改这里之前必须知道）：
+
+- **`create()` 不等 metadata**：先落库 `fetching` 立刻返回，`prepareTorrent` 后台选文件；
+  磁力 metadata 常常 1-2 分钟，超时**不能**标 `failed`，`refreshOne` 会继续补选文件
+- qB 添加是**幂等**的：5.x 对已存在种子返回 409，`addMagnetOrUrl` 先按 infohash 查再决定 add
+- 只下选中的文件 + `seq_dl` 顺序下载（`applyTorrentFiles`）
+- `availableBytes = min(磁盘大小, qB downloaded)`：**qB 预分配**时磁盘大小一开始就是整集，
+  不能拿来当可读范围；Range 的 end 要裁剪到已下载位置，不够就等/503
+- **`local_path` 必须是普通文件**：多文件种子的 `content_path` 是目录，曾经因此「下载完也播不了」
+- mkv/HEVC：走 **HLS 分片**（`GET .../hls.m3u8` 静态 VOD playlist + `GET .../hls/:i.ts` 按需转码）。
+  单条 fMP4 流拿不到总时长也不能 seek（用户实际反馈「进度条只有 20 秒」），已改掉。
+  ⚠️ 分片必须 `-copyts` 保留原始时间戳：每段从 0 开始会让 hls.js 判定时间戳回退，
+  播放卡在第一段末尾且**不报错**。分片缓存默认 tmp、TTL 6h、并发上限 2 个 ffmpeg。
+  `?format=fmp4` 仅作兜底保留
+- **字幕只做内嵌轨**：`getSubtitleTracks` / `getSubtitleVtt`（ffmpeg `-map 0:<index> -c:s webvtt`，
+  缓存到分片目录）。外挂 `.ass/.srt` 文件**不下载**（`setOnlyFile` 只保留视频），所以看不到；
+  PGS/DVD 图形字幕不可转、列表里过滤。ASS 只保留对白（样式全丢）。
+  ⚠️ 双语字幕是「同一时刻多个 cue」，必须在 `normalizeVtt` 里合并成一条多行，否则浏览器叠字
+- 点播室是**私人房间**：`POST /api/rooms/vod`（`anime_id = 0`，随机 `season_id`，不进公开列表）。
+  `ChatGateway.handleLeaveGroup` 对 `anime_id === 0` 的房间在**房主离开时直接销毁**
+  并广播 `room:destroyed`（放映室仍是 transferHost）
+- 房主创建播放会话时必须带 `groupId`（`dto.groupId`），否则成员拉流时
+  `findOwned` 查不到 `group_user_map`，观众端会 404「播放会话不存在」（踩过）
 
 ## No Tests
 

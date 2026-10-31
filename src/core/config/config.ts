@@ -116,6 +116,42 @@ export const playbackConfig = {
   searchMaxWebSources: Number(process.env.PLAYBACK_SEARCH_MAX_WEB || 6),
 };
 
+/**
+ * 播放转封装 / 转码（ffmpeg）。
+ *
+ * 浏览器只认 mp4/webm 这类容器与 h264/vp9/av1 这类编码；番剧磁力常见的
+ * `xxx.mkv`（HEVC 10bit + ASS 字幕）无法直接播。服务端用 ffmpeg 把**已下载的部分**
+ * 转成 fMP4 流，才能做到「边下边播」而不是等整集下完。
+ *
+ * 未安装 ffmpeg 时自动降级：会话仍可创建，但这类资源会提示换源，
+ * 不影响 mp4 直链/种子。
+ */
+export const transcodeConfig = {
+  ffmpegPath: (process.env.FFMPEG_PATH || 'ffmpeg').trim(),
+  ffprobePath: (process.env.FFPROBE_PATH || 'ffprobe').trim(),
+  enabled: (process.env.PLAYBACK_TRANSCODE || 'true').toLowerCase() === 'true',
+  /**
+   * auto = 优先硬件编码（macOS 的 h264_videotoolbox、NVIDIA 的 h264_nvenc），
+   * 都没有时回落 libx264。也可显式指定编码器名。
+   */
+  videoEncoder: (process.env.PLAYBACK_VIDEO_ENCODER || 'auto').trim(),
+  /** libx264 预设；硬件编码忽略该值 */
+  preset: (process.env.PLAYBACK_TRANSCODE_PRESET || 'veryfast').trim(),
+  /** 转码输出码率上限 */
+  maxBitrate: (process.env.PLAYBACK_TRANSCODE_MAX_BITRATE || '6M').trim(),
+  /**
+   * HLS 分片时长（秒）。
+   *
+   * mkv/HEVC 走「按需分片转码 + 静态 m3u8」：playlist 里带全部 EXTINF，
+   * 播放器因此知道总时长、能随意 seek；每个分片第一次被请求时才转码并落缓存。
+   */
+  segmentSeconds: Math.max(2, Number(process.env.PLAYBACK_HLS_SEGMENT || 6)),
+  /** 分片缓存目录（默认系统临时目录） */
+  hlsCacheDir: (process.env.PLAYBACK_HLS_CACHE_DIR || '').trim(),
+  /** 缓存保留时长（小时），超过后由定时器清理 */
+  hlsCacheTtlHours: Number(process.env.PLAYBACK_HLS_CACHE_TTL_HOURS || 6),
+};
+
 /** 可选：仅运维在服务端代拉外网时配置 */
 export const outboundConfig = {
   proxyUrl: (process.env.OUTBOUND_PROXY || '').trim(),

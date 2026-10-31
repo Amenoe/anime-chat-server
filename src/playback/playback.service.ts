@@ -5,13 +5,18 @@ import {
   NotFoundException,
   OnModuleDestroy,
   OnModuleInit,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { createReadStream, existsSync, statSync } from 'fs';
+import { createReadStream, existsSync, readFileSync, statSync } from 'fs';
 import { basename, isAbsolute, join, resolve } from 'path';
 import { Readable } from 'stream';
 import { Repository } from 'typeorm';
-import { playbackConfig, qbittorrentConfig } from '../core/config/config';
+import {
+  playbackConfig,
+  qbittorrentConfig,
+  transcodeConfig,
+} from '../core/config/config';
 import { outboundGet } from '../core/http/outbound';
 import { Group } from '../group/entities/group.entity';
 import { GroupUserMap } from '../group/entities/group_user_map.entity';
@@ -22,6 +27,7 @@ import {
   PlaybackSession,
   PlaybackStatus,
 } from './entities/playback-session.entity';
+import { MediaTranscodeService, ProbedMedia } from './media-transcode.service';
 import { QbittorrentService } from './qbittorrent.service';
 import { PlayCandidate, SourceSearchService } from './source-search.service';
 
@@ -31,6 +37,16 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
   private timer: NodeJS.Timeout | null = null;
   /** sessionId → 流媒体源请求头 */
   private streamHeaders = new Map<string, Record<string, string>>();
+  /** 本地文件探测结果缓存（path → 编码信息），避免每次 Range 请求都跑 ffprobe */
+  private probeCache = new Map<string, ProbedMedia | null>();
+  /** 探测失败后的冷却时间（避免对半截文件反复跑 ffprobe） */
+  private probeRetryAt = new Map<string, number>();
+  private hlsCleanupTimer: NodeJS.Timeout | null = null;
+  /** 同一分片并发生成时复用同一个转码任务 */
+  private segmentTasks = new Map<string, Promise<string>>();
+  /** 分片转码并发上限：每个 ffmpeg 都吃 CPU，开太多会把播放拖死 */
+  private activeTranscodes = 0;
+  private transcodeQueue: Array<() => void> = [];
 
   constructor(
     @InjectRepository(PlaybackSession)
@@ -41,6 +57,7 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     private readonly groupUserMapRepo: Repository<GroupUserMap>,
     private readonly qb: QbittorrentService,
     private readonly sourceSearch: SourceSearchService,
+    private readonly transcoder: MediaTranscodeService,
   ) {}
 
   onModuleInit() {
@@ -49,10 +66,17 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`poll: ${e instanceof Error ? e.message : e}`),
       );
     }, playbackConfig.pollIntervalMs);
+
+    // HLS 分片缓存按 TTL 清理：一部番能转出几百 MB，不能无限堆
+    this.hlsCleanupTimer = setInterval(
+      () => this.transcoder.cleanupSegmentCache(),
+      30 * 60 * 1000,
+    );
   }
 
   onModuleDestroy() {
     if (this.timer) clearInterval(this.timer);
+    if (this.hlsCleanupTimer) clearInterval(this.hlsCleanupTimer);
   }
 
   async qbHealth() {
@@ -194,6 +218,14 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     return this.toView(session, mode);
   }
 
+  /**
+   * 创建 BT 播放会话。
+   *
+   * **不再等 metadata**：先落库（fetching）立刻返回，前端拿到 id 就能挂播放器/轮询；
+   * 选文件、开顺序下载、等元数据都在后台 `prepareTorrent` 里做。
+   *
+   * 以前这里要同步等到文件列表（最长 30s），失败就 400，表现就是「还没下载就说不能播」。
+   */
   async create(userId: string, dto: CreatePlaybackDto) {
     const uri = (dto.uri || '').trim();
     if (!uri.startsWith('magnet:') && !/^https?:\/\//i.test(uri)) {
@@ -226,43 +258,82 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     });
     await this.sessionRepo.save(session);
 
-    try {
-      const hash = await this.qb.addMagnetOrUrl(uri);
-      session.info_hash = hash;
-      session.status = 'downloading';
-
-      let files = await this.qb.getFiles(hash);
-      for (let i = 0; i < 20 && !files.length; i++) {
-        await this.sleep(1500);
-        files = await this.qb.getFiles(hash);
-      }
-      if (!files.length) {
-        throw new BadRequestException('种子无文件列表（metadata 超时）');
-      }
-
-      const file =
-        dto.fileIndex != null
-          ? files.find((f) => f.index === dto.fileIndex)
-          : this.qb.pickBestVideoFile(files);
-      if (!file) {
-        throw new BadRequestException('未找到可播放的视频文件');
-      }
-
-      await this.qb.setOnlyFile(hash, file.index);
-      session.file_index = file.index;
-      session.file_name = file.name;
-      session.size_bytes = String(file.size);
-      session.local_path = this.resolveLocalPath(file.name);
-      await this.sessionRepo.save(session);
-    } catch (e) {
-      session.status = 'failed';
-      session.error_message =
-        e instanceof Error ? e.message : '创建播放会话失败';
-      await this.sessionRepo.save(session);
-      throw e;
-    }
+    void this.prepareTorrent(session, dto);
 
     return this.toView(session, 'progressive');
+  }
+
+  /** 后台补齐种子 metadata：选文件、置顺序下载、算本地路径 */
+  private async prepareTorrent(
+    session: PlaybackSession,
+    dto: CreatePlaybackDto,
+  ): Promise<void> {
+    try {
+      const hash = await this.qb.addMagnetOrUrl(session.source_uri);
+      session.info_hash = hash;
+      session.status = 'downloading';
+      await this.sessionRepo.save(session);
+
+      const files = await this.waitForFiles(hash, 20000);
+      if (!files.length) {
+        // 还没拿到 metadata 不是「不能播」，只是慢：保持 fetching，后续轮询会自动补齐
+        session.status = 'fetching';
+        session.error_message = '种子信息获取中（磁力可能需要 1-2 分钟）';
+        await this.sessionRepo.save(session);
+        return;
+      }
+
+      await this.applyTorrentFiles(session, files, dto.fileIndex);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : '创建播放会话失败';
+      // 「添加种子超时 / metadata 未就绪」都属于暂时状态，别标 failed
+      const transient = /metadata|超时|timeout|timed out/i.test(msg);
+      session.status = transient ? 'fetching' : 'failed';
+      session.error_message = msg;
+      await this.sessionRepo.save(session).catch(() => undefined);
+      this.logger.warn(`prepareTorrent ${session.id}: ${msg}`);
+    }
+  }
+
+  /** 从 qB 文件列表里选定视频文件并发起顺序下载 */
+  private async applyTorrentFiles(
+    session: PlaybackSession,
+    files: Array<{ index: number; name: string; size: number }>,
+    fileIndex?: number,
+  ): Promise<void> {
+    const file =
+      fileIndex != null
+        ? files.find((f) => f.index === fileIndex)
+        : this.qb.pickBestVideoFile(files as never);
+    if (!file) {
+      session.status = 'failed';
+      session.error_message = '未找到可播放的视频文件';
+      await this.sessionRepo.save(session);
+      return;
+    }
+
+    // 只下这一个文件 + 顺序下载：整包（字幕/截图/其它集）会抢带宽，也拖慢边下边播
+    await this.qb.setOnlyFile(session.info_hash, file.index);
+    await this.qb.setSequential(session.info_hash, true);
+
+    session.file_index = file.index;
+    session.file_name = file.name;
+    session.size_bytes = String(file.size);
+    session.local_path = this.resolveLocalPath(file.name);
+    session.status = 'downloading';
+    session.error_message = '';
+    await this.sessionRepo.save(session);
+  }
+
+  /** 等 qB 拿到文件列表（metadata）。下载中拿不到列表时给出明确失败原因 */
+  private async waitForFiles(hash: string, timeoutMs: number) {
+    const deadline = Date.now() + timeoutMs;
+    let files = await this.qb.getFiles(hash);
+    while (!files.length && Date.now() < deadline) {
+      await this.sleep(1000);
+      files = await this.qb.getFiles(hash);
+    }
+    return files;
   }
 
   async getSession(id: string, userId: string) {
@@ -284,13 +355,14 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
   /**
    * 出流：
    * 1) 流媒体：代理远端 URL（Range）；HLS playlist 会改写相对 URI 并同源代理分片/密钥
-   * 2) BT：本地 qB 目录 Range
+   * 2) BT 原生容器（mp4/webm/ts）：下载中即可出流，只读**已下载区间**
+   * 3) BT 非原生容器（mkv/HEVC）：ffmpeg 把已下载部分转成 fMP4 流
    */
   async openStream(
     id: string,
     userId: string,
     rangeHeader?: string,
-    opts?: { accessToken?: string },
+    opts?: { accessToken?: string; forceTranscode?: boolean },
   ): Promise<{
     stream: NodeJS.ReadableStream;
     contentType: string;
@@ -310,37 +382,374 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       return this.openRemoteStream(session, rangeHeader, opts?.accessToken);
     }
 
-    if (
-      session.status !== 'playable' &&
-      session.status !== 'ready' &&
-      session.status !== 'downloading'
-    ) {
-      throw new BadRequestException('资源尚未可播，请稍候');
+    if (!session.local_path) {
+      throw new ServiceUnavailableException('正在解析种子，请稍候');
     }
 
-    const local = session.local_path;
-    if (!local || !existsSync(local)) {
-      throw new BadRequestException('文件尚未落地，请稍候');
+    const probed = await this.probeLocal(session);
+    const remux = this.transcoder.needsRemux(session.file_name);
+    const badCodec = this.transcoder.needsVideoTranscode(probed?.videoCodec);
+    if (remux || badCodec || opts?.forceTranscode) {
+      return this.openRemuxedStream(session, rangeHeader, probed);
     }
 
-    const st = statSync(local);
+    // 原生容器：下载中也允许出流，但只返回真实落地的字节
+    const avail = await this.waitForAvailable(session, rangeHeader, 15000);
+    if (avail < 1024) {
+      throw new ServiceUnavailableException('缓冲不足，请稍候');
+    }
+    const st = statSync(session.local_path);
     const size = st.size;
-    if (size < 1024) {
-      throw new BadRequestException('文件过小，仍在缓冲');
+    const { start, end, partial } = this.computeRange(rangeHeader, size, avail);
+    return {
+      stream: createReadStream(session.local_path, { start, end }),
+      contentType: this.guessContentType(session.file_name),
+      size,
+      start,
+      end,
+      partial,
+    };
+  }
+
+  /**
+   * 当前会话的内嵌字幕轨列表（只列能转 VTT 的；PGS 这类图形字幕没法转）。
+   *
+   * 外挂字幕文件（种子里的 .srt/.ass）目前**不下载** —— 只下载选中的视频文件，
+   * 见 `docs/playback-architecture.md`。
+   */
+  async getSubtitleTracks(id: string, userId: string) {
+    const session = await this.findOwned(id, userId);
+    await this.refreshOne(session);
+    if (session.status === 'failed') {
+      throw new BadRequestException(session.error_message || '播放失败');
     }
-    if (
-      session.status === 'downloading' &&
-      size < playbackConfig.playableMinBytes
-    ) {
-      throw new BadRequestException('缓冲不足，请稍候');
+    const probed = await this.probeLocal(session);
+    return (probed?.subtitleTracks || [])
+      .filter((t) => t.convertible)
+      .map((t, i) => ({
+        index: t.index,
+        label: t.title || t.language || `字幕 ${i + 1}`,
+        language: t.language,
+        codec: t.codec,
+      }));
+  }
+
+  /** 把某条内嵌字幕轨转成 WebVTT（结果按会话缓存，重复请求不再跑 ffmpeg） */
+  async getSubtitleVtt(
+    id: string,
+    userId: string,
+    trackIndex: number,
+  ): Promise<string> {
+    const session = await this.findOwned(id, userId);
+    await this.refreshOne(session);
+    const probed = await this.probeLocal(session);
+    const track = (probed?.subtitleTracks || []).find(
+      (t) => t.index === trackIndex && t.convertible,
+    );
+    if (!track) throw new NotFoundException('字幕轨不存在');
+
+    const outPath = join(
+      this.transcoder.segmentDir(session.id),
+      `sub-${trackIndex}.vtt`,
+    );
+    if (this.isFilePath(outPath)) return readFileSync(outPath, 'utf8');
+
+    const inflight = this.segmentTasks.get(outPath);
+    if (inflight) {
+      await inflight;
+      return readFileSync(outPath, 'utf8');
     }
 
-    return this.buildRangeFromSize(
-      size,
-      rangeHeader,
-      (start, end) => createReadStream(local, { start, end }),
-      this.guessContentType(session.file_name),
+    const task = this.runWithConcurrencyLimit(async () => {
+      await this.transcoder.extractSubtitleVtt(
+        session.local_path,
+        trackIndex,
+        outPath,
+      );
+      return outPath;
+    });
+    this.segmentTasks.set(outPath, task);
+    try {
+      await task;
+      return readFileSync(outPath, 'utf8');
+    } finally {
+      this.segmentTasks.delete(outPath);
+    }
+  }
+
+  /**
+   * HLS 播放列表（mkv/HEVC 专用）。
+   *
+   * 与 fMP4 单流的关键区别：**整条 playlist 一次性给出全部 EXTINF**，
+   * 所以 hls.js 能算出总时长（进度条 = 视频真实长度）并允许 seek；
+   * 每个分片在第一次被请求时才转码，之后命中磁盘缓存。
+   */
+  async getHlsPlaylist(
+    id: string,
+    userId: string,
+    token?: string,
+  ): Promise<string> {
+    const session = await this.findOwned(id, userId);
+    await this.refreshOne(session);
+    if (session.status === 'failed') {
+      throw new BadRequestException(session.error_message || '播放失败');
+    }
+    if (!this.transcoder.checkAvailable()) {
+      throw new BadRequestException(
+        '服务器未安装 ffmpeg，无法播放 mkv/HEVC 资源，请换 mp4 源',
+      );
+    }
+
+    const probed = await this.probeLocal(session);
+    const duration = probed?.durationSec || 0;
+    if (duration < 1) {
+      throw new ServiceUnavailableException('正在读取视频信息，请稍候');
+    }
+
+    const seg = transcodeConfig.segmentSeconds;
+    const count = Math.ceil(duration / seg);
+    const lines = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      `#EXT-X-TARGETDURATION:${Math.ceil(seg)}`,
+      '#EXT-X-MEDIA-SEQUENCE:0',
+      '#EXT-X-PLAYLIST-TYPE:VOD',
+    ];
+    const q = token ? `?token=${encodeURIComponent(token)}` : '';
+    for (let i = 0; i < count; i++) {
+      const d = Math.min(seg, duration - i * seg);
+      lines.push(`#EXTINF:${d.toFixed(3)},`);
+      lines.push(`/api/playback/sessions/${id}/hls/${i}.ts${q}`);
+    }
+    lines.push('#EXT-X-ENDLIST');
+    return lines.join('\n');
+  }
+
+  /** 单个 HLS 分片：命中缓存直接给文件，否则按需转码（并发去重 + 限流） */
+  async getHlsSegment(
+    id: string,
+    userId: string,
+    index: number,
+  ): Promise<{ path: string; size: number }> {
+    const session = await this.findOwned(id, userId);
+    await this.refreshOne(session);
+    if (session.status === 'failed') {
+      throw new BadRequestException(session.error_message || '播放失败');
+    }
+
+    const probed = await this.probeLocal(session);
+    const duration = probed?.durationSec || 0;
+    if (duration < 1) {
+      throw new ServiceUnavailableException('正在读取视频信息，请稍候');
+    }
+
+    const seg = transcodeConfig.segmentSeconds;
+    const total = Math.ceil(duration / seg);
+    if (!Number.isFinite(index) || index < 0 || index >= total) {
+      throw new BadRequestException('分片不存在');
+    }
+
+    const start = index * seg;
+    const dur = Math.min(seg, duration - start);
+    // 还没下到这个位置：让 hls.js 自己退避重试，别把 0 字节当视频返回
+    const downloaded = this.downloadedSeconds(session, duration);
+    if (session.status !== 'ready' && downloaded + 1 < start) {
+      throw new ServiceUnavailableException('该位置尚未下载，请稍候');
+    }
+
+    const outPath = join(this.transcoder.segmentDir(session.id), `${index}.ts`);
+    if (this.isFilePath(outPath)) {
+      return { path: outPath, size: statSync(outPath).size };
+    }
+
+    const inflight = this.segmentTasks.get(outPath);
+    if (inflight) {
+      const path = await inflight;
+      return { path, size: statSync(path).size };
+    }
+
+    const task = this.runWithConcurrencyLimit(async () => {
+      await this.transcoder.transcodeSegment(
+        session.local_path,
+        start,
+        dur,
+        probed,
+        outPath,
+      );
+      return outPath;
+    });
+    this.segmentTasks.set(outPath, task);
+    try {
+      const path = await task;
+      return { path, size: statSync(path).size };
+    } finally {
+      this.segmentTasks.delete(outPath);
+    }
+  }
+
+  /**
+   * 已下载到第几秒。
+   *
+   * 依赖「顺序下载」：未下完时前 N 秒是连续的。ready 就直接算全片，
+   * 避免 downloaded 统计（含重复分片）比文件大小略小导致最后几片被误判未下载。
+   */
+  private downloadedSeconds(
+    session: PlaybackSession,
+    duration: number,
+  ): number {
+    if (session.status === 'ready') return duration;
+    const size = Number(session.size_bytes) || 0;
+    if (!size) return 0;
+    const avail = this.availableBytes(session);
+    return Math.min(duration, (avail / size) * duration);
+  }
+
+  /** 分片转码并发闸门：同时最多 2 个 ffmpeg，避免 seek 时把机器打满 */
+  private async runWithConcurrencyLimit<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.activeTranscodes >= 2) {
+      await new Promise<void>((resolve) => this.transcodeQueue.push(resolve));
+    }
+    this.activeTranscodes += 1;
+    try {
+      return await fn();
+    } finally {
+      this.activeTranscodes -= 1;
+      const next = this.transcodeQueue.shift();
+      if (next) next();
+    }
+  }
+
+  /** mkv / HEVC 等：把已下载部分转成 fMP4（不依赖 Range，不支持 seek） */
+  private async openRemuxedStream(
+    session: PlaybackSession,
+    rangeHeader: string | undefined,
+    probed: ProbedMedia | null,
+  ): Promise<{
+    stream: NodeJS.ReadableStream;
+    contentType: string;
+    size: number;
+    start: number;
+    end: number;
+    partial: boolean;
+  }> {
+    if (!this.transcoder.checkAvailable()) {
+      throw new BadRequestException(
+        '服务器未安装 ffmpeg，无法播放 mkv/HEVC 资源，请换 mp4 源',
+      );
+    }
+    if (session.status === 'fetching') {
+      throw new ServiceUnavailableException('正在解析种子，请稍候');
+    }
+    const avail = await this.waitForAvailable(session, rangeHeader, 15000);
+    if (avail < 1024 * 512) {
+      throw new ServiceUnavailableException('缓冲不足，请稍候');
+    }
+    const stream = this.transcoder.openFmp4Stream(
+      session.local_path,
+      avail,
+      probed,
     );
+    return {
+      stream,
+      contentType: 'video/mp4',
+      size: 0,
+      start: 0,
+      end: 0,
+      partial: false,
+    };
+  }
+
+  /**
+   * 等「够读」的字节数。
+   *
+   * 播放器一上来就请求 `bytes=0-`（甚至整段），下载中的文件只有前几 MB，
+   * 这里不会直接 400，而是等一段（默认 15s）再按已有范围返回 ——
+   * 配合前端「缓冲不足自动重试」，就是边下边播。
+   */
+  private async waitForAvailable(
+    session: PlaybackSession,
+    rangeHeader: string | undefined,
+    timeoutMs: number,
+  ): Promise<number> {
+    const need = this.rangeStart(rangeHeader);
+    const deadline = Date.now() + timeoutMs;
+    let avail = this.availableBytes(session);
+    while (Date.now() < deadline) {
+      if (avail > need && avail >= 1024) return avail;
+      // 已下完就没必要再等
+      if (session.status === 'ready' && avail > 0) return avail;
+      await this.sleep(500);
+      await this.refreshOne(session).catch(() => undefined);
+      avail = this.availableBytes(session);
+    }
+    return avail;
+  }
+
+  /** 已下载/可读字节数：预分配时磁盘大小是整集，不能直接当可用范围 */
+  private availableBytes(session: PlaybackSession): number {
+    if (!session.local_path || !existsSync(session.local_path)) return 0;
+    const st = statSync(session.local_path);
+    if (session.status === 'ready') return st.size;
+    const downloaded = Number(session.downloaded_bytes) || 0;
+    if (downloaded > 0) return Math.min(st.size, downloaded);
+    return st.size;
+  }
+
+  private rangeStart(rangeHeader?: string): number {
+    if (!rangeHeader) return 0;
+    const m = /bytes=(\d*)-/.exec(rangeHeader);
+    if (!m || m[1] === '') return 0;
+    const n = parseInt(m[1], 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  /** 把请求区间裁剪到已下载范围：未下到的地方不返回 0 字节 */
+  private computeRange(
+    rangeHeader: string | undefined,
+    size: number,
+    avail: number,
+  ): { start: number; end: number; partial: boolean } {
+    const maxEnd = Math.min(size - 1, Math.max(0, avail - 1));
+    if (!rangeHeader) {
+      // 没有 Range 时浏览器按「整段」处理；下载中只能先给到已下载位置
+      return { start: 0, end: maxEnd, partial: maxEnd < size - 1 };
+    }
+    const m = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
+    if (!m) return { start: 0, end: maxEnd, partial: maxEnd < size - 1 };
+    const start = m[1] === '' ? 0 : parseInt(m[1], 10) || 0;
+    const requestedEnd = m[2] === '' ? size - 1 : parseInt(m[2], 10);
+    if (start > maxEnd) {
+      throw new ServiceUnavailableException('缓冲不足，请稍候');
+    }
+    return {
+      start,
+      end: Math.min(requestedEnd, maxEnd),
+      partial: true,
+    };
+  }
+
+  /** 探测本地视频编码（带缓存：下载中的文件头部信息是稳定的） */
+  private async probeLocal(
+    session: PlaybackSession,
+  ): Promise<ProbedMedia | null> {
+    if (!session.local_path || !existsSync(session.local_path)) return null;
+    const st = statSync(session.local_path);
+    if (st.size < 1024 * 512) return null;
+    const cached = this.probeCache.get(session.local_path);
+    if (cached !== undefined && cached !== null) return cached;
+    if (cached === null) {
+      // 上次探测失败：给文件一点时间再试，避免每次 Range 都跑 ffprobe
+      const retryAt = this.probeRetryAt.get(session.local_path) || 0;
+      if (Date.now() < retryAt) return null;
+    }
+    const probed = this.transcoder.probe(session.local_path);
+    if (probed) {
+      this.probeCache.set(session.local_path, probed);
+    } else {
+      this.probeCache.set(session.local_path, null);
+      this.probeRetryAt.set(session.local_path, Date.now() + 10_000);
+    }
+    return probed;
   }
 
   /**
@@ -641,8 +1050,19 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (!session.info_hash) return session;
-    if (session.status === 'ready') return session;
     if (!this.qb.isEnabled()) return session;
+
+    // metadata 迟到（磁力可能要 1-2 分钟）：补选文件后自动开始下载
+    if (!session.file_name) {
+      const files = await this.qb.getFiles(session.info_hash);
+      if (files.length) {
+        await this.applyTorrentFiles(session, files);
+        return session;
+      }
+    }
+
+    // 注意：ready 也要往下走 —— 显式刷新一次 local_path，
+    // 否则历史会话（曾把 content_path 目录写进 local_path）永远播不了。
 
     const info = await this.qb.getTorrent(session.info_hash);
     if (!info) return session;
@@ -667,9 +1087,12 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
         );
 
     if (info.progress >= 0.999) {
-      session.status = 'ready';
-      await this.sessionRepo.save(session);
-      return session;
+      // 下满但文件还没出现（预分配/路径映射问题）时别标 ready，否则前端会一直重试空文件
+      if (session.local_path && existsSync(session.local_path)) {
+        session.status = 'ready';
+        await this.sessionRepo.save(session);
+        return session;
+      }
     }
 
     if (localReady || info.progress >= playbackConfig.playableProgress) {
@@ -682,6 +1105,14 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     return session;
   }
 
+  /**
+   * 把 qB 的容器路径映射到宿主机路径。
+   *
+   * ⚠️ 只接受**文件**：多文件种子的 `content_path` 是目录（如
+   * `/downloads/Big Buck Bunny`），以前只要 existsSync 就返回，结果
+   * `local_path` 指向目录，出流时 statSync 读到 160 字节、播放器永远「缓冲不足」，
+   * 表现就是「下载完也播不了」。
+   */
   private resolveLocalPath(
     fileName: string,
     savePath?: string,
@@ -695,23 +1126,32 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       !contentPath.endsWith('/')
     ) {
       const mapped = this.mapContainerPathToHost(contentPath, hostRoot);
-      if (mapped && existsSync(mapped)) return mapped;
+      if (mapped && this.isFilePath(mapped)) return mapped;
     }
 
     if (fileName) {
       const byName = join(hostRoot, fileName);
-      if (existsSync(byName)) return byName;
+      if (this.isFilePath(byName)) return byName;
     }
 
     if (savePath) {
       const mappedSave = this.mapContainerPathToHost(savePath, hostRoot);
       if (mappedSave && fileName) {
         const p = join(mappedSave, fileName);
-        if (existsSync(p)) return p;
+        if (this.isFilePath(p)) return p;
       }
     }
 
     return fileName ? join(hostRoot, fileName) : hostRoot;
+  }
+
+  /** 存在且是普通文件（新下载的文件还没落地时返回 false） */
+  private isFilePath(path: string): boolean {
+    try {
+      return existsSync(path) && statSync(path).isFile();
+    } catch {
+      return false;
+    }
   }
 
   private mapContainerPathToHost(containerPath: string, hostRoot: string) {
@@ -742,31 +1182,6 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     return { start, end, partial };
   }
 
-  private buildRangeFromSize(
-    size: number,
-    rangeHeader: string | undefined,
-    open: (start: number, end: number) => NodeJS.ReadableStream,
-    contentType: string,
-  ) {
-    let start = 0;
-    let end = size - 1;
-    let partial = false;
-    if (rangeHeader) {
-      const parsed = this.parseRange(rangeHeader, size);
-      start = parsed.start;
-      end = parsed.end;
-      partial = parsed.partial;
-    }
-    return {
-      stream: open(start, end),
-      contentType,
-      size,
-      start,
-      end,
-      partial,
-    };
-  }
-
   private guessContentType(name: string) {
     const lower = (name || '').toLowerCase();
     if (lower.includes('.m3u8')) return 'application/vnd.apple.mpegurl';
@@ -781,8 +1196,14 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
     session: PlaybackSession,
     playMode: 'progressive' | 'stream' | 'hls' = 'progressive',
   ) {
-    const playable =
-      session.status === 'playable' || session.status === 'ready';
+    // 不再是「playable/ready 才给地址」：下载中也要给，前端先挂播放器、缓冲不足自动重试
+    const playable = session.status !== 'failed';
+    const remuxRequired =
+      !this.isStreamSession(session) &&
+      (this.transcoder.needsRemux(session.file_name) ||
+        this.transcoder.needsVideoTranscode(
+          this.probeCache.get(session.local_path)?.videoCodec,
+        ));
     return {
       id: session.id,
       status: session.status as PlaybackStatus,
@@ -797,6 +1218,8 @@ export class PlaybackService implements OnModuleInit, OnModuleDestroy {
       episodeSort: session.episode_sort,
       playUrl: playable ? `/api/playback/sessions/${session.id}/stream` : null,
       playMode,
+      /** true = 服务端需要 ffmpeg 转封装/转码（mkv、HEVC 等），前端提示「转码播放」 */
+      remuxRequired,
     };
   }
 

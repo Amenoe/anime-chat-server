@@ -12,6 +12,7 @@ import {
 import { AuthGuard } from '@nestjs/passport';
 import { RoomService } from './room.service';
 import { CreateRoomDto } from './dto/create-room.dto';
+import { CreateVodRoomDto } from './dto/create-vod-room.dto';
 
 @Controller('rooms')
 @UseGuards(AuthGuard('jwt'))
@@ -32,6 +33,12 @@ export class RoomController {
   @Post()
   async create(@Req() req, @Body() dto: CreateRoomDto) {
     return this.roomService.createRoom(req.user.user_id, dto);
+  }
+
+  /** 新建私人点播室（邀请制，不绑番剧、不进公开列表） */
+  @Post('vod')
+  async createVod(@Req() req, @Body() dto: CreateVodRoomDto) {
+    return this.roomService.createVodRoom(req.user.user_id, dto.name);
   }
 
   @Get('by-key/:seasonId')

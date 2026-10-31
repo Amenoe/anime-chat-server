@@ -1,12 +1,19 @@
-# 生产可选：qBittorrent（BT 下载）
-# 本地测试不需要；直接把视频放进 MEDIA_ROOT 即可播
+# qBittorrent（BT 边下边播）：本地开发与生产通用
 #
 #   mkdir -p data/bt-downloads
 #   docker compose -f docker-compose.playback.yml up -d
 #
-# WebUI http://<host>:8085
-# .env.production: QB_ENABLED=true  MEDIA_ROOT=./data/bt-downloads
-# 卷须与 MEDIA_ROOT 指向同一宿主机目录
+# WebUI http://localhost:8085
+# .env.development / .env.production 需同时配置：
+#   QB_ENABLED=true
+#   QB_URL=http://127.0.0.1:8085
+#   QB_DOWNLOAD_PATH=<宿主机的 absolute path>/data/bt-downloads
+# 即卷 `./data/bt-downloads:/downloads` 的宿主机侧必须与 QB_DOWNLOAD_PATH 指向同一目录，
+# 否则 qB 下完的文件 Nest 读不到（DB 里的 local_path 会对不上）。
+#
+# ⚠️ qB 4.6.1+ 首次启动不再使用 admin/adminadmin，而是随机临时密码：
+#   docker logs anime-chat-qbittorrent | grep "temporary password"
+# 用该密码登录后改成 QB_PASSWORD 指定的值；删除 qb-config 卷重建会再次回到临时密码。
 
 services:
   qbittorrent:

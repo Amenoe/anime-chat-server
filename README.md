@@ -19,7 +19,14 @@
 | `JWT_ACCESS_EXPIRES_IN`  | **可选**。accessToken 有效期，默认 `2h`                                                          |
 | `JWT_REFRESH_EXPIRES_IN` | **可选**。refreshToken 有效期，默认 `30d`                                                        |
 | `MINIO_*`                | 头像对象存储                                                                                     |
-| `QB_*`                   | qBittorrent（BT 边下边播）                                                                       |
+| `QB_*`                   | qBittorrent（BT 边下边播）。`QB_ENABLED` 开关、`QB_URL`/`QB_USERNAME`/`QB_PASSWORD`；`QB_DOWNLOAD_PATH` 须与 `docker-compose.playback.yml` 里 `./data/bt-downloads:/downloads` 的宿主机目录一致，详见 [docs/playback-architecture.md](../docs/playback-architecture.md) |
+| `FFMPEG_PATH` / `FFPROBE_PATH` | **可选**。ffmpeg/ffprobe 路径（默认 `ffmpeg`/`ffprobe`）。mkv/HEVC 靠它转封装成 fMP4，找不到时只影响这类资源 |
+| `PLAYBACK_TRANSCODE`     | **可选**。默认 `true`；`false` 完全关闭服务端转封装（mkv 会提示换 mp4 源）                     |
+| `PLAYBACK_VIDEO_ENCODER` | **可选**。`auto`（默认，按平台选 videotoolbox/nvenc/qsv，回落 libx264）或显式指定               |
+| `PLAYBACK_TRANSCODE_MAX_BITRATE` | **可选**。转码输出码率上限，默认 `6M`                                                    |
+| `PLAYBACK_HLS_SEGMENT`   | **可选**。HLS 分片时长（秒），默认 `6`；越小 seek 越准、转码请求越多                              |
+| `PLAYBACK_HLS_CACHE_DIR` | **可选**。分片缓存目录，默认 `<tmp>/anime-chat-hls`                                               |
+| `PLAYBACK_HLS_CACHE_TTL_HOURS` | **可选**。分片缓存保留小时数，默认 `6`                                                     |
 | `OUTBOUND_PROXY`         | **可选**。搜源在浏览器完成，服务器通常不需要；仅运维代拉时配置                                   |
 | `AI_SERVICE_URL`         | **可选**。anime-ai 服务地址，默认 `http://127.0.0.1:8013`                                        |
 | `AI_INTERNAL_TOKEN`      | 与 anime-ai 的 `ai.internal-token` **必须一致**，否则转发被拒 401；留空则两侧都不校验（仅本地）  |
@@ -63,13 +70,21 @@
 ## 播放 API
 
 ```http
-POST /api/playback/sessions/stream   # 直链
-POST /api/playback/sessions          # magnet / torrent
-GET  /api/playback/sessions/:id/stream?token=
+POST /api/playback/sessions/stream   # 直链（立即 ready）
+POST /api/playback/sessions          # magnet / torrent（立即返回 fetching，后台补 metadata）
+GET  /api/playback/sessions/:id      # 轮询进度；status=fetching/downloading 也能播
+GET  /api/playback/sessions/:id/stream?token=   # 原生容器：Range 流（下载中也能播）
+GET  /api/playback/sessions/:id/hls.m3u8?token= # mkv/HEVC：静态 VOD playlist（有时长、可 seek）
+GET  /api/playback/sessions/:id/hls/:i.ts?token=  # 分片：首次请求时转码，之后走缓存
+GET  /api/playback/sessions/:id/subtitles        # 内嵌字幕轨（外挂字幕文件不下载）
+GET  /api/playback/sessions/:id/subtitle/:track.vtt?token=  # 字幕转 WebVTT
 GET  /api/media-sources              # 用户订阅列表
+POST /api/rooms/vod                  # 新建私人点播室（邀请链接 /vod/<seasonId>，不绑番剧）
 ```
 
-BT 需 `QB_ENABLED=true` + docker-compose.playback.yml。
+BT 需 `QB_ENABLED=true` + docker-compose.playback.yml。播放是**边下边播**：
+出流只读已下载区间，缓冲不足返回 503，前端播放器自动重试。详见
+[docs/playback-architecture.md](../docs/playback-architecture.md)。
 
 ## 放映室（一起看）
 

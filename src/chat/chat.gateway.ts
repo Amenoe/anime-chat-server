@@ -675,6 +675,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       const roomSockets = this.getRoomSocketIds(groupId);
 
       if (roomSockets.length === 0) {
+        // 放映室与点播室都是「空房即销毁」，聊天记录随之清理
         await this.roomService.destroyRoom(groupId);
         return;
       }
@@ -705,6 +706,17 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
           where: { group_id: groupId },
         });
         if (group && group.host_user_id === userId) {
+          // 点播室（anime_id = 0）是私人房间：房主离开就解散，不做房主转让
+          if (group.anime_id === 0) {
+            this.server.to(groupId).emit('room:destroyed', {
+              group_id: groupId,
+            });
+            // 成员由前端收到 room:destroyed 后自行退出；这里不强制 kick，
+            // 避免依赖 adapter 内部 API（旧类型里没有 socketsLeave）
+            await this.roomService.destroyRoom(groupId);
+            return;
+          }
+
           let earliest: SocketMeta | null = null;
           for (const sid of roomSockets) {
             const m = this.socketMeta.get(sid);

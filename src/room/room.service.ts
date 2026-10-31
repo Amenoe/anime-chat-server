@@ -27,6 +27,14 @@ export interface PlaybackStateView {
   updated_at: Date | null;
 }
 
+/**
+ * 点播室：**私人房间**。
+ *
+ * 与放映室的区别只有两点：不绑番剧（`anime_id = 0`，不会出现在详情页的房间里）、
+ * 不进公开列表，靠邀请链接 `/vod/:seasonId` 进房。播放同步、聊天、房主转让都复用
+ * 放映室那套 `group` + `playback:*` 机制。
+ */
+
 @Injectable()
 export class RoomService {
   constructor(
@@ -37,6 +45,23 @@ export class RoomService {
     @InjectRepository(GroupUserMap)
     private readonly groupUserMapRepository: Repository<GroupUserMap>,
   ) {}
+
+  /** 新建一个点播室（房主 = 创建者，房间 key 随机、只能靠邀请链接进） */
+  async createVodRoom(userId: string, name?: string): Promise<Group> {
+    const group = this.groupRepository.create({
+      season_id: generateSeasonId(),
+      host_user_id: userId,
+      user_id: userId,
+      // 0 = 不绑定番剧，因此不会出现在「详情页 → 该番的放映室」列表里
+      anime_id: 0,
+      group_name: (name?.trim() || '我的点播室').slice(0, 40),
+      notice: '邀请链接进入；房主控制进度，文明聊天',
+      playback_status: 'idle',
+      is_public: 0,
+      create_time: String(Date.now()),
+    });
+    return this.groupRepository.save(group);
+  }
 
   async createRoom(userId: string, dto: CreateRoomDto): Promise<Group> {
     const group = this.groupRepository.create({
